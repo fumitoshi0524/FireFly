@@ -1,8 +1,8 @@
 import torch
 from torch.optim import Optimizer
 
-from fireflykernels import update_packed_ternary_weight_
-from bitLinear import BitLinear
+from .fireflykernels import update_packed_ternary_weight_
+from .bitLinear import BitLinear
 
 
 class FireFlyProb(Optimizer):

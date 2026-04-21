@@ -3,7 +3,7 @@ import math
 import torch
 from torch import nn
 
-from fireflykernels import (
+from .fireflykernels import (
     PackedBitLinearFn,
     consume_bit_grad,
     next_bit_handle,

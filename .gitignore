@@ -15,11 +15,6 @@ wheels/
 # uv self generated files
 uv.lock
 
-# data results and other generated files
-data/**/*.txt
-data/**/*.pkl
-data/**/*.bin
-
 # built kernel files
 kernels/build/
 kernels/build-ninja-msvc/
