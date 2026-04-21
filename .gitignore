@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# github actions
+.github/
+
+# uv self generated files
+uv.lock
+
+# data results and other generated files
+data/**/*.txt
+data/**/*.pkl
+data/**/*.bin
+
+# built kernel files
+kernels/build/
+kernels/build-ninja-msvc/
+
+build_local_cuda.bat
+
+# vscode settings
+.vscode/
+
+# output files
+out/
