@@ -13,6 +13,7 @@ class FireFlyProb(Optimizer):
         lr_dense=1e-3,
         vote_interval=4,
         vote_threshold=3,
+        clip_grad=1.0,
         bit_modules=None,
     ):
         defaults = dict(
@@ -20,6 +21,7 @@ class FireFlyProb(Optimizer):
             lr_dense=lr_dense,
             vote_interval=vote_interval,
             vote_threshold=vote_threshold,
+            clip_grad=clip_grad,
         )
         super().__init__(params, defaults)
         self.bit_modules = list(bit_modules) if bit_modules is not None else []
@@ -35,6 +37,13 @@ class FireFlyProb(Optimizer):
 
     @torch.no_grad()
     def step(self):
+        dense_params = [
+            p for g in self.param_groups for p in g["params"] if p.grad is not None
+        ]
+        if dense_params:
+            torch.nn.utils.clip_grad_norm_(
+                dense_params, max_norm=self.defaults["clip_grad"]
+            )
         for group in self.param_groups:
             lr_dense = group["lr_dense"]
 
