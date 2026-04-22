@@ -41,18 +41,20 @@ class BitLinear(nn.Module):
         out_features: int,
         bias: bool = False,
         threshold: float = 0.0,
+        n0prob: float = 0.3,
     ) -> None:
         super().__init__()
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.threshold = float(threshold)
         self.scale = 1.0 / math.sqrt(in_features)
+        self.n0prob = float(n0prob)
 
         if self.threshold == 0.0:
             packed_init = _init_packed_ternary_weight(
                 out_features=self.out_features,
                 in_features=self.in_features,
-                prob=0.3,
+                prob=self.n0prob,
                 device=torch.device("cpu"),
             )
         else:
