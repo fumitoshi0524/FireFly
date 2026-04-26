@@ -45,7 +45,7 @@ class FireFlyProb(Optimizer):
                 dense_params, max_norm=self.defaults["clip_grad"]
             )
         for group in self.param_groups:
-            lr_dense = group["lr_dense"]
+            lr_dense = group.get("lr", group["lr_dense"])
 
             for p in group["params"]:
                 if p.grad is None:
