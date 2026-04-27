@@ -119,9 +119,10 @@ class FireFlyProb(Optimizer):
                     in_features=module.in_features,
                 )
 
-                m[mask] = (m[mask] - direction[mask] * float(vote_threshold)).clamp_(
+                m_update = (m[mask].float() - direction[mask] * float(vote_threshold)).clamp_(
                     -vote_clip, vote_clip
                 )
+                m[mask] = m_update.to(m.dtype)
 
         for group in self.param_groups:
             for p in group["params"]:
