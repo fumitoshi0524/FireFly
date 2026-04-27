@@ -73,12 +73,12 @@ class FireFlyProb(Optimizer):
                 handle = int(module._bit_handle.item())
                 state = self._bit_state.setdefault(handle, {})
                 if "m" not in state or state["m"].shape != g.shape:
-                    state["m"] = torch.zeros_like(g, dtype=torch.float32)
-                    state["v"] = torch.zeros_like(g, dtype=torch.float32)
+                    state["m"] = torch.zeros_like(g, dtype=torch.bfloat16)
+                    state["v"] = torch.zeros_like(g, dtype=torch.bfloat16)
                     state["t"] = 0
                 elif state["m"].device != g.device:
-                    state["m"] = state["m"].to(device=g.device, dtype=torch.float32)
-                    state["v"] = state["v"].to(device=g.device, dtype=torch.float32)
+                    state["m"] = state["m"].to(device=g.device, dtype=torch.bfloat16)
+                    state["v"] = state["v"].to(device=g.device, dtype=torch.bfloat16)
 
                 m, v = state["m"], state["v"]
                 state["t"] += 1
