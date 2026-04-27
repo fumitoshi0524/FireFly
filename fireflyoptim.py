@@ -11,24 +11,17 @@ class FireFlyProb(Optimizer):
         params,
         base_ratio=0.002,
         lr_dense=1e-3,
-        vote_interval=4,
-        vote_threshold=3,
-        vote_scale=1.0,
         clip_grad=1.0,
         bit_modules=None,
     ):
         defaults = dict(
             base_ratio=base_ratio,
             lr_dense=lr_dense,
-            vote_interval=vote_interval,
-            vote_threshold=vote_threshold,
-            vote_scale=vote_scale,
             clip_grad=clip_grad,
         )
         super().__init__(params, defaults)
         self.bit_modules = list(bit_modules) if bit_modules is not None else []
         self._bit_state: dict[int, dict[str, torch.Tensor]] = {}
-        self._bit_step = 0
 
     def add_bit_modules(self, modules) -> None:
         for module in modules:
@@ -70,11 +63,6 @@ class FireFlyProb(Optimizer):
         if self.bit_modules:
             cfg = self.param_groups[0]
             base_ratio = cfg["base_ratio"]
-            vote_interval = max(1, int(cfg["vote_interval"]))
-            vote_threshold = min(vote_interval, max(1, int(cfg["vote_threshold"])))
-            vote_scale = max(1.0, float(cfg.get("vote_scale", 1.0)))
-            self._bit_step += max(1, int(round(vote_scale)))
-            do_vote_update = (self._bit_step % vote_interval) == 0
 
             for module in self.bit_modules:
                 g = module.consume_weight_grad()
@@ -85,29 +73,29 @@ class FireFlyProb(Optimizer):
                 handle = int(module._bit_handle.item())
                 state = self._bit_state.setdefault(handle, {})
                 if "m" not in state or state["m"].shape != g.shape:
-                    state["m"] = torch.zeros_like(g, dtype=torch.float16)
+                    state["m"] = torch.zeros_like(g, dtype=torch.float32)
+                    state["v"] = torch.zeros_like(g, dtype=torch.float32)
+                    state["t"] = 0
                 elif state["m"].device != g.device:
-                    state["m"] = state["m"].to(device=g.device, dtype=torch.float16)
-                m = state["m"]
+                    state["m"] = state["m"].to(device=g.device, dtype=torch.float32)
+                    state["v"] = state["v"].to(device=g.device, dtype=torch.float32)
 
-                g_abs = g.abs()
-                mag_norm = (g_abs / (g_abs.mean() + 1e-8)).clamp_(0.0, 4.0)
-                signed_vote = (torch.sign(g) * mag_norm * vote_scale).to(m.dtype)
-                m.add_(signed_vote)
-                vote_clip = float(vote_interval)
-                m.clamp_(-vote_clip, vote_clip)
+                m, v = state["m"], state["v"]
+                state["t"] += 1
+                beta1, beta2 = 0.9, 0.95
+                m.mul_(beta1).add_(g, alpha=1 - beta1)
+                v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                m_hat = m / (1 - beta1 ** state["t"])
+                v_hat = v / (1 - beta2 ** state["t"])
 
-                if not do_vote_update:
-                    continue
-
-                direction = torch.sign(m.float())
-                confidence = m.abs().float()
-                eligible = confidence >= float(vote_threshold)
+                direction = torch.sign(m_hat)
+                score = m_hat.abs() / (v_hat.sqrt() + 1e-8)
+                eligible = direction != 0
                 if not torch.any(eligible):
                     continue
 
-                prob = confidence / (confidence.mean() + 1e-8)
-                prob = (prob * mag_norm * base_ratio).clamp_(0, 1)
+                prob = score / (score.mean() + 1e-8)
+                prob = (prob * base_ratio).clamp_(0, 1)
                 mask = (torch.rand_like(prob) < prob) & eligible
                 if not torch.any(mask):
                     continue
@@ -119,11 +107,6 @@ class FireFlyProb(Optimizer):
                     in_features=module.in_features,
                 )
 
-                m_update = (m[mask].float() - direction[mask] * float(vote_threshold)).clamp_(
-                    -vote_clip, vote_clip
-                )
-                m[mask] = m_update.to(m.dtype)
-
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is not None:
@@ -131,7 +114,6 @@ class FireFlyProb(Optimizer):
 
     def state_dict(self):
         state = super().state_dict()
-        state["bit_step"] = int(self._bit_step)
         state["bit_state"] = {
             int(handle): {
                 key: value.clone() if torch.is_tensor(value) else value
@@ -143,10 +125,9 @@ class FireFlyProb(Optimizer):
 
     def load_state_dict(self, state_dict):
         state_dict = dict(state_dict)
-        bit_step = int(state_dict.pop("bit_step", 0))
+        state_dict.pop("bit_step", None)  # backward-compat for old checkpoints
         bit_state = state_dict.pop("bit_state", {})
         super().load_state_dict(state_dict)
-        self._bit_step = bit_step
         self._bit_state = {
             int(handle): {
                 key: value.clone() if torch.is_tensor(value) else value

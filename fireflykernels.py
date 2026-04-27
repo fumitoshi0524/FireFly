@@ -188,7 +188,12 @@ class PackedBitLinearFn(torch.autograd.Function):
                 float(ctx.scale),
             )
         grad_w = grad_out_f32.t().matmul(x_f32) * float(ctx.scale)
-        _BIT_GRAD_CACHE[int(ctx.handle)] = grad_w
+        handle = int(ctx.handle)
+        cached = _BIT_GRAD_CACHE.get(handle)
+        if cached is None:
+            _BIT_GRAD_CACHE[handle] = grad_w
+        else:
+            cached.add_(grad_w)
 
         return grad_in.to(dtype=ctx.input_dtype), None, None, None, None
 
