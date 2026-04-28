@@ -9,7 +9,7 @@ class FireFlyOptim(Optimizer):
     def __init__(
         self,
         params,
-        step_size=1.0,
+        step_size=10.0,
         lr_dense=1e-3,
         clip_grad=1.0,
         bit_modules=None,
