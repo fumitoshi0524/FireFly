@@ -9,13 +9,13 @@ class FireFlyOptim(Optimizer):
     def __init__(
         self,
         params,
-        base_ratio=0.01,
+        snr_threshold=1.0,
         lr_dense=1e-3,
         clip_grad=1.0,
         bit_modules=None,
     ):
         defaults = dict(
-            base_ratio=base_ratio,
+            snr_threshold=snr_threshold,
             lr_dense=lr_dense,
             clip_grad=clip_grad,
         )
@@ -62,7 +62,7 @@ class FireFlyOptim(Optimizer):
 
         if self.bit_modules:
             cfg = self.param_groups[0]
-            base_ratio = cfg["base_ratio"]
+            snr_threshold = cfg["snr_threshold"]
 
             for module in self.bit_modules:
                 g = module.consume_weight_grad()
@@ -100,24 +100,12 @@ class FireFlyOptim(Optimizer):
 
                 direction = torch.sign(m_hat)
                 score = m_hat.abs() / (v_hat.sqrt() + 1e-8)
-                eligible = direction != 0
-                if not torch.any(eligible):
+
+                # only flip when SNR exceeds the absolute threshold
+                # score > 1.0 means signal genuinely exceeds noise
+                mask = (score > snr_threshold) & (direction != 0)
+                if not torch.any(mask):
                     continue
-
-                eligible_mask = eligible.view(-1)
-                eligible_indices = eligible_mask.nonzero(as_tuple=True)[0]
-                num_eligible = eligible_indices.numel()
-                k = max(1, int(num_eligible * base_ratio))
-                if k > num_eligible:
-                    k = num_eligible
-
-                eligible_scores = score.view(-1)[eligible_mask]
-                _, topk_local = torch.topk(eligible_scores, k)
-                topk_flat = eligible_indices[topk_local]
-
-                mask = torch.zeros(score.numel(), dtype=torch.bool, device=score.device)
-                mask[topk_flat] = True
-                mask = mask.view(score.shape)
 
                 update_packed_ternary_weight_(
                     packed_weight=module.packed_weight,
