@@ -9,13 +9,13 @@ class FireFlyOptim(Optimizer):
     def __init__(
         self,
         params,
-        step_size=10.0,
+        lr_ternary=0.01,
         lr_dense=1e-3,
         clip_grad=1.0,
         bit_modules=None,
     ):
         defaults = dict(
-            step_size=step_size,
+            lr_ternary=lr_ternary,
             lr_dense=lr_dense,
             clip_grad=clip_grad,
         )
@@ -62,7 +62,7 @@ class FireFlyOptim(Optimizer):
 
         if self.bit_modules:
             cfg = self.param_groups[0]
-            step_size = cfg["step_size"]
+            lr_ternary = cfg["lr_ternary"]
 
             for module in self.bit_modules:
                 g = module.consume_weight_grad()
@@ -74,21 +74,30 @@ class FireFlyOptim(Optimizer):
                 state = self._bit_state.setdefault(handle, {})
                 if "m" not in state or state["m"].shape != g.shape:
                     state["m"] = torch.zeros_like(g, dtype=torch.bfloat16)
+                    state["v"] = torch.zeros_like(g, dtype=torch.bfloat16)
                     state["t"] = 0
-                elif state["m"].device != g.device or state["m"].dtype != torch.bfloat16:
+                elif (
+                    state["m"].device != g.device
+                    or state["m"].dtype != torch.bfloat16
+                    or state["v"].dtype != torch.bfloat16
+                ):
                     state["m"] = state["m"].to(device=g.device, dtype=torch.bfloat16)
+                    state["v"] = state["v"].to(device=g.device, dtype=torch.bfloat16)
 
-                m = state["m"]
+                m, v = state["m"], state["v"]
                 state["t"] += 1
                 g_bf16 = g.to(dtype=torch.bfloat16)
                 m.mul_(0.9).add_(g_bf16, alpha=0.1)
+                v.mul_(0.95).addcmul_(g_bf16, g_bf16, value=0.05)
 
                 m_hat = m.float() / (1 - 0.9 ** state["t"])
+                v_hat = v.float() / (1 - 0.95 ** state["t"])
                 direction = torch.sign(m_hat)
 
-                # stochastic rounding: P(flip) = η·|m_hat|, clamped to [0,1]
-                # E[w_new] = w_old - η·m_hat  (unbiased)
-                prob = (step_size * m_hat.abs()).clamp(0.0, 1.0)
+                # DQT-style stochastic rounding:
+                # P(flip) = |lr * m_hat / √v_hat|  — probability from Adam update magnitude
+                adam_update = lr_ternary * m_hat / (v_hat.sqrt() + 1e-8)
+                prob = adam_update.abs().clamp(0.0, 1.0)
                 mask = (torch.rand_like(prob) < prob) & (direction != 0)
                 if not torch.any(mask):
                     continue
@@ -121,10 +130,10 @@ class FireFlyOptim(Optimizer):
         state_dict.pop("bit_step", None)  # backward-compat for old checkpoints
         bit_state = state_dict.pop("bit_state", {})
         super().load_state_dict(state_dict)
-        self._bit_state = {}
-        for handle, per_handle in bit_state.items():
-            per_handle.pop("v", None)  # drop legacy variance from old checkpoints
-            self._bit_state[int(handle)] = {
+        self._bit_state = {
+            int(handle): {
                 key: value.clone() if torch.is_tensor(value) else value
                 for key, value in per_handle.items()
             }
+            for handle, per_handle in bit_state.items()
+        }
