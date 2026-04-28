@@ -90,6 +90,11 @@ class FireFlyOptim(Optimizer):
                 g_bf16 = g.to(dtype=torch.bfloat16)
                 m.mul_(beta1).add_(g_bf16, alpha=1 - beta1)
                 v.mul_(beta2).addcmul_(g_bf16, g_bf16, value=1 - beta2)
+
+                # skip bit flips until Adam accumulates reliable SNR (~20 steps ≈ 2× momentum horizon)
+                if state["t"] < 20:
+                    continue
+
                 m_hat = m.float() / (1 - beta1 ** state["t"])
                 v_hat = v.float() / (1 - beta2 ** state["t"])
 
