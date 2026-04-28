@@ -5,11 +5,11 @@ from .fireflykernels import update_packed_ternary_weight_
 from .bitLinear import BitLinear
 
 
-class FireFlyProb(Optimizer):
+class FireFlyOptim(Optimizer):
     def __init__(
         self,
         params,
-        base_ratio=0.002,
+        base_ratio=0.01,
         lr_dense=1e-3,
         clip_grad=1.0,
         bit_modules=None,
@@ -99,22 +99,20 @@ class FireFlyProb(Optimizer):
                 if not torch.any(eligible):
                     continue
 
-                score_mean = score.mean().detach()
-                if "score_ema" not in state:
-                    state["score_ema"] = score_mean
-                else:
-                    if (
-                        not torch.is_tensor(state["score_ema"])
-                        or state["score_ema"].device != score_mean.device
-                    ):
-                        state["score_ema"] = score_mean
-                    state["score_ema"] = state["score_ema"] * 0.95 + score_mean * 0.05
-                norm = torch.clamp(state["score_ema"], min=1e-8)
-                prob = (score / norm) * base_ratio
-                prob = prob.clamp_(0, 0.25)
-                mask = (torch.rand_like(prob) < prob) & eligible
-                if not torch.any(mask):
-                    continue
+                eligible_mask = eligible.view(-1)
+                eligible_indices = eligible_mask.nonzero(as_tuple=True)[0]
+                num_eligible = eligible_indices.numel()
+                k = max(1, int(num_eligible * base_ratio))
+                if k > num_eligible:
+                    k = num_eligible
+
+                eligible_scores = score.view(-1)[eligible_mask]
+                _, topk_local = torch.topk(eligible_scores, k)
+                topk_flat = eligible_indices[topk_local]
+
+                mask = torch.zeros(score.numel(), dtype=torch.bool, device=score.device)
+                mask[topk_flat] = True
+                mask = mask.view(score.shape)
 
                 update_packed_ternary_weight_(
                     packed_weight=module.packed_weight,

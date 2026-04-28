@@ -286,15 +286,17 @@ def update_packed_ternary_weight_(
         neg_dir = active & (d_lane < 0)
         new_codes = codes.clone()
 
-        pos_drop = pos_dir & (codes == 1)  # +1 -> 0
-        pos_to_neg = pos_dir & (codes == 0)  # 0 -> -1
-        neg_raise = neg_dir & (codes == 2)  # -1 -> 0
-        neg_to_pos = neg_dir & (codes == 0)  # 0 -> +1
+        # pos_dir: momentum says push toward +1
+        pos_from_neg = pos_dir & (codes == 2)  # -1 → 0  (step up from floor)
+        pos_rise = pos_dir & (codes == 0)      #  0 → +1 (step up)
+        # neg_dir: momentum says push toward -1
+        neg_from_pos = neg_dir & (codes == 1)  # +1 → 0  (step down from ceiling)
+        neg_fall = neg_dir & (codes == 0)      #  0 → -1 (step down)
 
-        new_codes[pos_drop] = 0
-        new_codes[pos_to_neg] = 2
-        new_codes[neg_raise] = 0
-        new_codes[neg_to_pos] = 1
+        new_codes[pos_from_neg] = 0
+        new_codes[pos_rise] = 1
+        new_codes[neg_from_pos] = 0
+        new_codes[neg_fall] = 2
 
         clear_mask = torch.tensor(
             0xFF ^ (0x3 << (2 * shift)), device=packed_weight.device, dtype=torch.uint8
