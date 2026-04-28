@@ -76,17 +76,22 @@ class FireFlyProb(Optimizer):
                     state["m"] = torch.zeros_like(g, dtype=torch.bfloat16)
                     state["v"] = torch.zeros_like(g, dtype=torch.bfloat16)
                     state["t"] = 0
-                elif state["m"].device != g.device:
+                elif (
+                    state["m"].device != g.device
+                    or state["m"].dtype != torch.bfloat16
+                    or state["v"].dtype != torch.bfloat16
+                ):
                     state["m"] = state["m"].to(device=g.device, dtype=torch.bfloat16)
                     state["v"] = state["v"].to(device=g.device, dtype=torch.bfloat16)
 
                 m, v = state["m"], state["v"]
                 state["t"] += 1
                 beta1, beta2 = 0.9, 0.95
-                m.mul_(beta1).add_(g, alpha=1 - beta1)
-                v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
-                m_hat = m / (1 - beta1 ** state["t"])
-                v_hat = v / (1 - beta2 ** state["t"])
+                g_bf16 = g.to(dtype=torch.bfloat16)
+                m.mul_(beta1).add_(g_bf16, alpha=1 - beta1)
+                v.mul_(beta2).addcmul_(g_bf16, g_bf16, value=1 - beta2)
+                m_hat = m.float() / (1 - beta1 ** state["t"])
+                v_hat = v.float() / (1 - beta2 ** state["t"])
 
                 direction = torch.sign(m_hat)
                 score = m_hat.abs() / (v_hat.sqrt() + 1e-8)
@@ -94,8 +99,19 @@ class FireFlyProb(Optimizer):
                 if not torch.any(eligible):
                     continue
 
-                prob = score / (score.mean() + 1e-8)
-                prob = (prob * base_ratio).clamp_(0, 1)
+                score_mean = score.mean().detach()
+                if "score_ema" not in state:
+                    state["score_ema"] = score_mean
+                else:
+                    if (
+                        not torch.is_tensor(state["score_ema"])
+                        or state["score_ema"].device != score_mean.device
+                    ):
+                        state["score_ema"] = score_mean
+                    state["score_ema"] = state["score_ema"] * 0.95 + score_mean * 0.05
+                norm = torch.clamp(state["score_ema"], min=1e-8)
+                prob = (score / norm) * base_ratio
+                prob = prob.clamp_(0, 0.25)
                 mask = (torch.rand_like(prob) < prob) & eligible
                 if not torch.any(mask):
                     continue

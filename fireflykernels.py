@@ -1,4 +1,5 @@
 import importlib
+import warnings
 
 import torch
 
@@ -8,6 +9,7 @@ _NEXT_HANDLE = 1
 _REGISTERED_HANDLES: set[int] = set()
 _BIT_GRAD_CACHE: dict[int, torch.Tensor] = {}
 _EXT_CANDIDATES = ("firefly_ext", "firefly_bitnet_ext")
+_EXT_WARNED = False
 
 
 def next_bit_handle() -> int:
@@ -73,7 +75,7 @@ def pack_ternary_weight(weight: torch.Tensor, threshold: float = 0.0) -> torch.T
 
 
 def _get_firefly_bitnet_ext():
-    global _FF_EXT
+    global _FF_EXT, _EXT_WARNED
     if _FF_EXT is not False:
         return _FF_EXT
     for mod_name in _EXT_CANDIDATES:
@@ -82,7 +84,47 @@ def _get_firefly_bitnet_ext():
             break
         except Exception:
             _FF_EXT = None
+    if _FF_EXT is None and not _EXT_WARNED:
+        _EXT_WARNED = True
+        warnings.warn(
+            "firefly_bitnet_ext is unavailable; falling back to Python packed kernels.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return _FF_EXT
+
+
+def _accumulate_weight_grad(
+    grad_out_2d: torch.Tensor,
+    x_2d: torch.Tensor,
+    scale: float,
+    chunk_rows: int = 512,
+) -> torch.Tensor:
+    out_features = grad_out_2d.shape[1]
+    in_features = x_2d.shape[1]
+    grad_w = torch.zeros(
+        (out_features, in_features),
+        device=grad_out_2d.device,
+        dtype=torch.bfloat16,
+    )
+    for start in range(0, grad_out_2d.shape[0], chunk_rows):
+        end = min(start + chunk_rows, grad_out_2d.shape[0])
+        go = grad_out_2d[start:end].to(dtype=torch.bfloat16)
+        xx = x_2d[start:end].to(dtype=torch.bfloat16)
+        grad_w.add_(go.t().matmul(xx))
+    if scale != 1.0:
+        grad_w.mul_(scale)
+    return grad_w
+
+
+def _ext_backward_weight(ext, grad_out: torch.Tensor, x_saved: torch.Tensor, scale: float):
+    if ext is None or not hasattr(ext, "ff_packed_linear_backward_weight"):
+        return None
+    return ext.ff_packed_linear_backward_weight(
+        grad_out.contiguous().float(),
+        x_saved.contiguous().float(),
+        float(scale),
+    )
 
 
 def _packed_linear_forward_fallback(
@@ -151,7 +193,8 @@ class PackedBitLinearFn(torch.autograd.Function):
         handle: int,
     ):
         ext = _get_firefly_bitnet_ext()
-        x_f32 = x2d.contiguous().float()
+        x_saved = x2d.contiguous()
+        x_f32 = x_saved.float()
         if ext is None:
             out = _packed_linear_forward_fallback(
                 x_f32, packed_weight.contiguous(), int(in_features), float(scale)
@@ -160,17 +203,17 @@ class PackedBitLinearFn(torch.autograd.Function):
             out = ext.ff_packed_linear_forward(
                 x_f32, packed_weight.contiguous(), int(in_features), float(scale)
             )
-        ctx.save_for_backward(x_f32, packed_weight)
+        ctx.save_for_backward(x_saved, packed_weight)
         ctx.in_features = int(in_features)
         ctx.scale = float(scale)
         ctx.handle = int(handle)
         ctx.input_dtype = x2d.dtype
-        return out
+        return out.to(dtype=ctx.input_dtype)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         ext = _get_firefly_bitnet_ext()
-        x_f32, packed_weight = ctx.saved_tensors
+        x_saved, packed_weight = ctx.saved_tensors
         grad_out_f32 = grad_out.contiguous().float()
 
         if ext is None:
@@ -187,7 +230,15 @@ class PackedBitLinearFn(torch.autograd.Function):
                 int(ctx.in_features),
                 float(ctx.scale),
             )
-        grad_w = grad_out_f32.t().matmul(x_f32) * float(ctx.scale)
+        grad_w = _ext_backward_weight(ext, grad_out, x_saved, float(ctx.scale))
+        if grad_w is None:
+            grad_w = _accumulate_weight_grad(
+                grad_out_2d=grad_out.contiguous(),
+                x_2d=x_saved,
+                scale=float(ctx.scale),
+            )
+        else:
+            grad_w = grad_w.to(dtype=torch.bfloat16)
         handle = int(ctx.handle)
         cached = _BIT_GRAD_CACHE.get(handle)
         if cached is None:

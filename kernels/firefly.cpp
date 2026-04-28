@@ -2,6 +2,7 @@
 
 torch::Tensor ff_packed_linear_forward_cuda(torch::Tensor x, torch::Tensor packed_w, int64_t in_features, double scale);
 torch::Tensor ff_packed_linear_backward_input_cuda(torch::Tensor grad_out, torch::Tensor packed_w, int64_t in_features, double scale);
+torch::Tensor ff_packed_linear_backward_weight_cuda(torch::Tensor grad_out, torch::Tensor x, double scale);
 
 #if !FIREFLY_USE_CUDA
 torch::Tensor ff_packed_linear_forward_cuda(torch::Tensor, torch::Tensor, int64_t, double)
@@ -10,6 +11,11 @@ torch::Tensor ff_packed_linear_forward_cuda(torch::Tensor, torch::Tensor, int64_
 }
 
 torch::Tensor ff_packed_linear_backward_input_cuda(torch::Tensor, torch::Tensor, int64_t, double)
+{
+    TORCH_CHECK(false, "firefly_bitnet_ext was built without CUDA support");
+}
+
+torch::Tensor ff_packed_linear_backward_weight_cuda(torch::Tensor, torch::Tensor, double)
 {
     TORCH_CHECK(false, "firefly_bitnet_ext was built without CUDA support");
 }
@@ -97,6 +103,16 @@ torch::Tensor ff_packed_linear_backward_input_cpu(torch::Tensor grad_out, torch:
     return grad_x;
 }
 
+torch::Tensor ff_packed_linear_backward_weight_cpu(torch::Tensor grad_out, torch::Tensor x, double scale)
+{
+    auto go_c = grad_out.contiguous();
+    auto x_c = x.contiguous();
+    auto grad_w = torch::matmul(go_c.transpose(0, 1), x_c);
+    if (scale != 1.0)
+        grad_w.mul_(static_cast<float>(scale));
+    return grad_w;
+}
+
 torch::Tensor ff_packed_linear_forward(torch::Tensor x, torch::Tensor packed_w, int64_t in_features, double scale)
 {
     if (x.is_cuda())
@@ -111,8 +127,16 @@ torch::Tensor ff_packed_linear_backward_input(torch::Tensor grad_out, torch::Ten
     return ff_packed_linear_backward_input_cpu(grad_out, packed_w, in_features, scale);
 }
 
+torch::Tensor ff_packed_linear_backward_weight(torch::Tensor grad_out, torch::Tensor x, double scale)
+{
+    if (grad_out.is_cuda())
+        return ff_packed_linear_backward_weight_cuda(grad_out, x, scale);
+    return ff_packed_linear_backward_weight_cpu(grad_out, x, scale);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("ff_packed_linear_forward", &ff_packed_linear_forward, "packed ternary linear forward");
     m.def("ff_packed_linear_backward_input", &ff_packed_linear_backward_input, "packed ternary linear backward input");
+    m.def("ff_packed_linear_backward_weight", &ff_packed_linear_backward_weight, "packed ternary linear backward weight");
 }

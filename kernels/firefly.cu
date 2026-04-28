@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAMacros.h>
 
 __device__ __forceinline__ float decode_code(uint8_t code)
 {
@@ -61,6 +62,22 @@ __global__ void ff_packed_linear_backward_input_kernel(
     grad_x[idx] = acc * scale;
 }
 
+__global__ void ff_packed_linear_backward_weight_kernel(
+    const float *grad_out, const float *x, float *grad_w,
+    int64_t M, int64_t N, int64_t K, float scale)
+{
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = N * K;
+    if (idx >= total)
+        return;
+    int64_t n = idx / K;
+    int64_t k = idx % K;
+    float acc = 0.0f;
+    for (int64_t m = 0; m < M; ++m)
+        acc += grad_out[m * N + n] * x[m * K + k];
+    grad_w[idx] = acc * scale;
+}
+
 torch::Tensor ff_packed_linear_forward_cuda(torch::Tensor x, torch::Tensor packed_w, int64_t in_features, double scale)
 {
     auto x_c = x.contiguous();
@@ -76,6 +93,7 @@ torch::Tensor ff_packed_linear_forward_cuda(torch::Tensor x, torch::Tensor packe
     ff_packed_linear_forward_kernel<<<blocks, threads>>>(
         x_c.data_ptr<float>(), w_c.data_ptr<uint8_t>(), out.data_ptr<float>(),
         M, N, in_features, B, static_cast<float>(scale));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
@@ -94,5 +112,25 @@ torch::Tensor ff_packed_linear_backward_input_cuda(torch::Tensor grad_out, torch
     ff_packed_linear_backward_input_kernel<<<blocks, threads>>>(
         go_c.data_ptr<float>(), w_c.data_ptr<uint8_t>(), grad_x.data_ptr<float>(),
         M, N, in_features, B, static_cast<float>(scale));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return grad_x;
+}
+
+torch::Tensor ff_packed_linear_backward_weight_cuda(torch::Tensor grad_out, torch::Tensor x, double scale)
+{
+    auto go_c = grad_out.contiguous();
+    auto x_c = x.contiguous();
+    const auto M = go_c.size(0);
+    const auto N = go_c.size(1);
+    const auto K = x_c.size(1);
+    auto grad_w = torch::zeros({N, K}, grad_out.options().dtype(torch::kFloat32));
+
+    const int threads = 256;
+    const int64_t total = N * K;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    ff_packed_linear_backward_weight_kernel<<<blocks, threads>>>(
+        go_c.data_ptr<float>(), x_c.data_ptr<float>(), grad_w.data_ptr<float>(),
+        M, N, K, static_cast<float>(scale));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return grad_w;
 }
