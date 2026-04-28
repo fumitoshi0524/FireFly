@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <c10/cuda/CUDAMacros.h>
+#include <c10/cuda/CUDAException.h>
 
 __device__ __forceinline__ float decode_code(uint8_t code)
 {
@@ -93,7 +93,7 @@ torch::Tensor ff_packed_linear_forward_cuda(torch::Tensor x, torch::Tensor packe
     ff_packed_linear_forward_kernel<<<blocks, threads>>>(
         x_c.data_ptr<float>(), w_c.data_ptr<uint8_t>(), out.data_ptr<float>(),
         M, N, in_features, B, static_cast<float>(scale));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
@@ -112,7 +112,7 @@ torch::Tensor ff_packed_linear_backward_input_cuda(torch::Tensor grad_out, torch
     ff_packed_linear_backward_input_kernel<<<blocks, threads>>>(
         go_c.data_ptr<float>(), w_c.data_ptr<uint8_t>(), grad_x.data_ptr<float>(),
         M, N, in_features, B, static_cast<float>(scale));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_CUDA_CHECK(cudaGetLastError());
     return grad_x;
 }
 
@@ -131,6 +131,6 @@ torch::Tensor ff_packed_linear_backward_weight_cuda(torch::Tensor grad_out, torc
     ff_packed_linear_backward_weight_kernel<<<blocks, threads>>>(
         go_c.data_ptr<float>(), x_c.data_ptr<float>(), grad_w.data_ptr<float>(),
         M, N, K, static_cast<float>(scale));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_CUDA_CHECK(cudaGetLastError());
     return grad_w;
 }
