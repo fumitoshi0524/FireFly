@@ -113,7 +113,7 @@ class BitLinear(nn.Module):
                 "BitLinear channel_scale and output must be on same device. "
                 "Move module with model.to(device) before forward."
             )
-        out2d = out2d * self.channel_scale.clamp(0.25, 4.0).to(dtype=out2d.dtype)
+        out2d = out2d * self.channel_scale.to(dtype=out2d.dtype)
         if self.bias is not None:
             if self.bias.device != out2d.device:
                 raise RuntimeError(
