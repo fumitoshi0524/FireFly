@@ -117,8 +117,9 @@ class FireFlyOptim(Optimizer):
                     in_features=module.in_features,
                 )
 
-                # discharge residual for flipped weights
-                residual[mask] -= direction[mask].to(dtype=torch.bfloat16)
+                # residual_new = residual_old - Δw
+                # kernel flips: Δw = -direction → residual += direction
+                residual[mask] += direction[mask].to(dtype=torch.bfloat16)
 
         for group in self.param_groups:
             for p in group["params"]:
