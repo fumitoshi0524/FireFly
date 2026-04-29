@@ -12,12 +12,14 @@ class FireFlyOptim(Optimizer):
         lr_ternary=0.01,
         lr_dense=1e-3,
         clip_grad=1.0,
+        theta=0.1,
         bit_modules=None,
     ):
         defaults = dict(
             lr_ternary=lr_ternary,
             lr_dense=lr_dense,
             clip_grad=clip_grad,
+            theta=theta,
         )
         super().__init__(params, defaults)
         self.bit_modules = list(bit_modules) if bit_modules is not None else []
@@ -63,6 +65,7 @@ class FireFlyOptim(Optimizer):
         if self.bit_modules:
             cfg = self.param_groups[0]
             lr_ternary = cfg["lr_ternary"]
+            theta = cfg["theta"]
 
             for module in self.bit_modules:
                 g = module.consume_weight_grad()
@@ -75,6 +78,7 @@ class FireFlyOptim(Optimizer):
                 if "m" not in state or state["m"].shape != g.shape:
                     state["m"] = torch.zeros_like(g, dtype=torch.bfloat16)
                     state["v"] = torch.zeros_like(g, dtype=torch.bfloat16)
+                    state["residual"] = torch.zeros_like(g, dtype=torch.bfloat16)
                     state["t"] = 0
                 elif (
                     state["m"].device != g.device
@@ -83,8 +87,9 @@ class FireFlyOptim(Optimizer):
                 ):
                     state["m"] = state["m"].to(device=g.device, dtype=torch.bfloat16)
                     state["v"] = state["v"].to(device=g.device, dtype=torch.bfloat16)
+                    state["residual"] = state["residual"].to(device=g.device, dtype=torch.bfloat16)
 
-                m, v = state["m"], state["v"]
+                m, v, residual = state["m"], state["v"], state["residual"]
                 state["t"] += 1
                 g_bf16 = g.to(dtype=torch.bfloat16)
                 m.mul_(0.9).add_(g_bf16, alpha=0.1)
@@ -92,12 +97,15 @@ class FireFlyOptim(Optimizer):
 
                 m_hat = m.float() / (1 - 0.9 ** state["t"])
                 v_hat = v.float() / (1 - 0.95 ** state["t"])
-                direction = torch.sign(m_hat)
 
-                # DQT-style stochastic rounding:
-                # P(flip) = |lr * m_hat / √v_hat|  — probability from Adam update magnitude
+                # OU residual: accumulate Adam update, apply mean reversion
+                # residual tracks the continuous offset virtual_w - w_ternary
                 adam_update = lr_ternary * m_hat / (v_hat.sqrt() + 1e-8)
-                prob = adam_update.abs().clamp(0.0, 1.0)
+                residual.add_(adam_update.to(dtype=torch.bfloat16))
+                residual.mul_(1.0 - theta)
+
+                direction = torch.sign(residual.float())
+                prob = residual.float().abs().clamp(0.0, 1.0)
                 mask = (torch.rand_like(prob) < prob) & (direction != 0)
                 if not torch.any(mask):
                     continue
@@ -108,6 +116,9 @@ class FireFlyOptim(Optimizer):
                     mask=mask,
                     in_features=module.in_features,
                 )
+
+                # discharge residual for flipped weights
+                residual[mask] -= direction[mask].to(dtype=torch.bfloat16)
 
         for group in self.param_groups:
             for p in group["params"]:
@@ -127,13 +138,13 @@ class FireFlyOptim(Optimizer):
 
     def load_state_dict(self, state_dict):
         state_dict = dict(state_dict)
-        state_dict.pop("bit_step", None)  # backward-compat for old checkpoints
+        state_dict.pop("bit_step", None)
         bit_state = state_dict.pop("bit_state", {})
         super().load_state_dict(state_dict)
-        self._bit_state = {
-            int(handle): {
+        self._bit_state = {}
+        for handle, per_handle in bit_state.items():
+            per_handle.pop("score_ema", None)  # backward-compat
+            self._bit_state[int(handle)] = {
                 key: value.clone() if torch.is_tensor(value) else value
                 for key, value in per_handle.items()
             }
-            for handle, per_handle in bit_state.items()
-        }
