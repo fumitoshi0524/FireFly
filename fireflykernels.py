@@ -1,14 +1,13 @@
+import torch
 import importlib
 import warnings
 
-import torch
 
-
-_FF_EXT = False
 _NEXT_HANDLE = 1
 _REGISTERED_HANDLES: set[int] = set()
 _BIT_GRAD_CACHE: dict[int, torch.Tensor] = {}
-_EXT_CANDIDATES = ("firefly_ext", "firefly_bitnet_ext")
+_FF_EXT = False
+_EXT_CANDIDATES = ("firefly_int8_ext", "firefly_bitnet_ext")
 _EXT_WARNED = False
 
 
@@ -44,37 +43,7 @@ def consume_bit_grad(handle: int) -> torch.Tensor | None:
     return _BIT_GRAD_CACHE.pop(int(handle), None)
 
 
-def _to_ternary_codes(weight: torch.Tensor, threshold: float = 0.0) -> torch.Tensor:
-    thr = float(threshold)
-    pos = weight > thr
-    neg = weight < -thr
-    codes = torch.zeros_like(weight, dtype=torch.uint8)
-    codes[pos] = 1
-    codes[neg] = 2
-    return codes
-
-
-def pack_ternary_weight(weight: torch.Tensor, threshold: float = 0.0) -> torch.Tensor:
-    if weight.ndim != 2:
-        raise ValueError(
-            f"weight must be 2D [out_features, in_features], got {tuple(weight.shape)}"
-        )
-    out_features, in_features = weight.shape
-    codes = _to_ternary_codes(weight, threshold=threshold)
-    pad = (-in_features) % 4
-    if pad:
-        codes = torch.nn.functional.pad(codes, (0, pad), value=0)
-    codes = codes.view(out_features, -1, 4).to(torch.int16)
-    packed = (
-        codes[..., 0]
-        | (codes[..., 1] << 2)
-        | (codes[..., 2] << 4)
-        | (codes[..., 3] << 6)
-    ).to(torch.uint8)
-    return packed.contiguous()
-
-
-def _get_firefly_bitnet_ext():
+def _get_firefly_ext():
     global _FF_EXT, _EXT_WARNED
     if _FF_EXT is not False:
         return _FF_EXT
@@ -87,219 +56,115 @@ def _get_firefly_bitnet_ext():
     if _FF_EXT is None and not _EXT_WARNED:
         _EXT_WARNED = True
         warnings.warn(
-            "firefly_bitnet_ext is unavailable; falling back to Python packed kernels.",
+            "firefly_int8_ext is unavailable; falling back to Python INT8 kernels.",
             RuntimeWarning,
             stacklevel=2,
         )
     return _FF_EXT
 
 
-def _accumulate_weight_grad(
-    grad_out_2d: torch.Tensor,
-    x_2d: torch.Tensor,
-    scale: float,
-    chunk_rows: int = 512,
-) -> torch.Tensor:
-    out_features = grad_out_2d.shape[1]
-    in_features = x_2d.shape[1]
-    grad_w = torch.zeros(
-        (out_features, in_features),
-        device=grad_out_2d.device,
-        dtype=torch.bfloat16,
-    )
-    for start in range(0, grad_out_2d.shape[0], chunk_rows):
-        end = min(start + chunk_rows, grad_out_2d.shape[0])
-        go = grad_out_2d[start:end].to(dtype=torch.bfloat16)
-        xx = x_2d[start:end].to(dtype=torch.bfloat16)
-        grad_w.add_(go.t().matmul(xx))
-    if scale != 1.0:
-        grad_w.mul_(scale)
-    return grad_w
-
-
-def _ext_backward_weight(ext, grad_out: torch.Tensor, x_saved: torch.Tensor, scale: float):
-    if ext is None or not hasattr(ext, "ff_packed_linear_backward_weight"):
-        return None
-    return ext.ff_packed_linear_backward_weight(
-        grad_out.contiguous().float(),
-        x_saved.contiguous().float(),
-        float(scale),
-    )
-
-
-def _packed_linear_forward_fallback(
-    x_f32: torch.Tensor, packed_weight: torch.Tensor, in_features: int, scale: float
-) -> torch.Tensor:
-    out_features, packed_cols = packed_weight.shape
-    expected_cols = (in_features + 3) // 4
-    if packed_cols != expected_cols:
+def quantize_fp_to_int8(weight: torch.Tensor, eps: float = 1e-8):
+    if weight.ndim != 2:
         raise ValueError(
-            f"packed_weight second dim mismatch: expected {expected_cols}, got {packed_cols}"
+            f"weight must be 2D [out_features, in_features], got {tuple(weight.shape)}"
         )
-
-    out = x_f32.new_zeros((x_f32.shape[0], out_features))
-    code_to_val = torch.tensor(
-        [0.0, 1.0, -1.0, 0.0], device=x_f32.device, dtype=x_f32.dtype
-    )
-    pw = packed_weight.to(device=x_f32.device)
-
-    for shift in range(4):
-        cols = x_f32[:, shift:in_features:4]
-        if cols.shape[1] == 0:
-            continue
-        codes = ((pw >> (2 * shift)) & 0x3).to(torch.long)
-        w_shift = code_to_val[codes[:, : cols.shape[1]]]
-        out.addmm_(cols, w_shift.t())
-
-    if scale != 1.0:
-        out.mul_(scale)
-    return out
+    w = weight.float()
+    scale = w.abs().amax(dim=1, keepdim=True).clamp_min(float(eps)) / 127.0
+    q = torch.round(w / scale).clamp(-127, 127).to(torch.int8)
+    return q.contiguous(), scale.squeeze(1).contiguous()
 
 
-def _packed_linear_backward_input_fallback(
-    grad_out_f32: torch.Tensor,
-    packed_weight: torch.Tensor,
-    in_features: int,
-    scale: float,
-) -> torch.Tensor:
-    batch = grad_out_f32.shape[0]
-    grad_x = grad_out_f32.new_zeros((batch, in_features))
-    code_to_val = torch.tensor(
-        [0.0, 1.0, -1.0, 0.0], device=grad_out_f32.device, dtype=grad_out_f32.dtype
-    )
-    pw = packed_weight.to(device=grad_out_f32.device)
-
-    for shift in range(4):
-        k_idx = torch.arange(shift, in_features, 4, device=grad_out_f32.device)
-        if k_idx.numel() == 0:
-            continue
-        codes = ((pw[:, : k_idx.numel()] >> (2 * shift)) & 0x3).to(torch.long)
-        w_shift = code_to_val[codes]
-        grad_x[:, k_idx] = grad_out_f32.matmul(w_shift)
-
-    if scale != 1.0:
-        grad_x.mul_(scale)
-    return grad_x
+def _quantize_activation_per_token(x2d: torch.Tensor, eps: float = 1e-8):
+    x = x2d.float()
+    scale = x.abs().amax(dim=1, keepdim=True).clamp_min(float(eps)) / 127.0
+    q = torch.round(x / scale).clamp(-127, 127).to(torch.int8)
+    return q.contiguous(), scale.contiguous()
 
 
-class PackedBitLinearFn(torch.autograd.Function):
+class Int8LinearFn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
         x2d: torch.Tensor,
-        packed_weight: torch.Tensor,
-        in_features: int,
-        scale: float,
+        int_weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        channel_scale: torch.Tensor,
+        bias: torch.Tensor | None,
         handle: int,
     ):
-        ext = _get_firefly_bitnet_ext()
-        x_saved = x2d.contiguous()
-        x_f32 = x_saved.float()
-        if ext is None:
-            out = _packed_linear_forward_fallback(
-                x_f32, packed_weight.contiguous(), int(in_features), float(scale)
-            )
+        ext = _get_firefly_ext()
+        x_saved = x2d.contiguous().float()
+        x_q, x_scale = _quantize_activation_per_token(x_saved)
+        if ext is not None and hasattr(ext, "ff_int8_linear_forward"):
+            out_i32 = ext.ff_int8_linear_forward(x_q.contiguous(), int_weight.contiguous())
         else:
-            out = ext.ff_packed_linear_forward(
-                x_f32, packed_weight.contiguous(), int(in_features), float(scale)
-            )
-        ctx.save_for_backward(x_saved, packed_weight)
-        ctx.in_features = int(in_features)
-        ctx.scale = float(scale)
+            out_i32 = x_q.to(torch.int32).matmul(int_weight.to(torch.int32).t())
+        out = out_i32.float() * (x_scale * weight_scale.float().view(1, -1))
+        out.mul_(channel_scale.float().view(1, -1))
+        if bias is not None:
+            out.add_(bias.float().view(1, -1))
+
+        ctx.save_for_backward(x_saved, int_weight, weight_scale, channel_scale)
         ctx.handle = int(handle)
         ctx.input_dtype = x2d.dtype
-        return out.to(dtype=ctx.input_dtype)
+        ctx.has_bias = bias is not None
+        return out.to(dtype=x2d.dtype)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        ext = _get_firefly_bitnet_ext()
-        x_saved, packed_weight = ctx.saved_tensors
+        ext = _get_firefly_ext()
+        x_saved, int_weight, weight_scale, channel_scale = ctx.saved_tensors
         grad_out_f32 = grad_out.contiguous().float()
 
-        if ext is None:
-            grad_in = _packed_linear_backward_input_fallback(
+        if ext is not None and hasattr(ext, "ff_int8_linear_backward_input"):
+            grad_in = ext.ff_int8_linear_backward_input(
                 grad_out_f32,
-                packed_weight.contiguous(),
-                int(ctx.in_features),
-                float(ctx.scale),
+                int_weight.contiguous(),
+                weight_scale.float().contiguous(),
+                channel_scale.float().contiguous(),
             )
         else:
-            grad_in = ext.ff_packed_linear_backward_input(
-                grad_out_f32,
-                packed_weight.contiguous(),
-                int(ctx.in_features),
-                float(ctx.scale),
-            )
-        grad_w = _ext_backward_weight(ext, grad_out, x_saved, float(ctx.scale))
-        if grad_w is None:
-            grad_w = _accumulate_weight_grad(
-                grad_out_2d=grad_out.contiguous(),
-                x_2d=x_saved,
-                scale=float(ctx.scale),
-            )
-        else:
-            grad_w = grad_w.to(dtype=torch.bfloat16)
-        handle = int(ctx.handle)
-        cached = _BIT_GRAD_CACHE.get(handle)
-        if cached is None:
-            _BIT_GRAD_CACHE[handle] = grad_w
-        else:
-            cached.add_(grad_w)
+            w_deq = int_weight.float() * weight_scale.float().unsqueeze(1)
+            w_eff = w_deq * channel_scale.float().unsqueeze(1)
+            grad_in = grad_out_f32.matmul(w_eff)
 
-        return grad_in.to(dtype=ctx.input_dtype), None, None, None, None
+        if ext is not None and hasattr(ext, "ff_int8_linear_backward_weight"):
+            grad_w = ext.ff_int8_linear_backward_weight(grad_out_f32, x_saved)
+        else:
+            grad_w = grad_out_f32.t().matmul(x_saved)
+        grad_w.mul_(channel_scale.float().unsqueeze(1))
+        cached = _BIT_GRAD_CACHE.get(ctx.handle)
+        if cached is None:
+            _BIT_GRAD_CACHE[ctx.handle] = grad_w.to(dtype=torch.bfloat16)
+        else:
+            cached.add_(grad_w.to(dtype=torch.bfloat16))
+
+        w_deq = int_weight.float() * weight_scale.float().unsqueeze(1)
+        pre_channel = x_saved.matmul(w_deq.t())
+        grad_channel_scale = (grad_out_f32 * pre_channel).sum(dim=0).to(
+            dtype=channel_scale.dtype
+        )
+        grad_bias = (
+            grad_out_f32.sum(dim=0).to(dtype=grad_out.dtype) if ctx.has_bias else None
+        )
+        return (
+            grad_in.to(dtype=ctx.input_dtype),
+            None,
+            None,
+            grad_channel_scale,
+            grad_bias,
+            None,
+        )
 
 
 @torch.no_grad()
-def update_packed_ternary_weight_(
-    packed_weight: torch.Tensor,
-    direction: torch.Tensor,
-    mask: torch.Tensor,
-    in_features: int,
-) -> None:
-    if direction.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        direction = direction.float()
-    if mask.dtype != torch.bool:
-        mask = mask.bool()
-
-    out_features = packed_weight.shape[0]
-    if direction.shape != (out_features, in_features):
+def update_int8_weight_(int_weight: torch.Tensor, delta_q: torch.Tensor) -> None:
+    if int_weight.dtype != torch.int8:
+        raise TypeError(f"int_weight must be torch.int8, got {int_weight.dtype}")
+    if delta_q.shape != int_weight.shape:
         raise ValueError(
-            f"direction shape mismatch: expected {(out_features, in_features)}, got {tuple(direction.shape)}"
+            f"delta_q shape mismatch: expected {tuple(int_weight.shape)}, got {tuple(delta_q.shape)}"
         )
-    if mask.shape != (out_features, in_features):
-        raise ValueError(
-            f"mask shape mismatch: expected {(out_features, in_features)}, got {tuple(mask.shape)}"
-        )
-
-    for shift in range(4):
-        lane_cols = (in_features - shift + 3) // 4
-        if lane_cols <= 0:
-            continue
-        src = packed_weight[:, :lane_cols]
-        codes = ((src >> (2 * shift)) & 0x3).to(torch.uint8)
-
-        d_lane = direction[:, shift:in_features:4]
-        m_lane = mask[:, shift:in_features:4].bool()
-        active = m_lane & (d_lane != 0)
-
-        pos_dir = active & (d_lane > 0)  # gradient positive → descend toward -1
-        neg_dir = active & (d_lane < 0)  # gradient negative → descend toward +1
-        new_codes = codes.clone()
-
-        # m_hat > 0: gradient says loss increases with w → move negative (descent)
-        pos_drop = pos_dir & (codes == 1)   # +1 → 0
-        pos_to_neg = pos_dir & (codes == 0) #  0 → -1
-        # m_hat < 0: gradient says loss decreases with w → move positive (descent)
-        neg_raise = neg_dir & (codes == 2)  # -1 → 0
-        neg_to_pos = neg_dir & (codes == 0) #  0 → +1
-
-        new_codes[pos_drop] = 0
-        new_codes[pos_to_neg] = 2
-        new_codes[neg_raise] = 0
-        new_codes[neg_to_pos] = 1
-
-        clear_mask = torch.tensor(
-            0xFF ^ (0x3 << (2 * shift)), device=packed_weight.device, dtype=torch.uint8
-        )
-        merged = (src & clear_mask) | (new_codes << (2 * shift))
-        packed_weight[:, :lane_cols].copy_(merged)
+    next_weight = int_weight.to(torch.int16).add_(delta_q.to(torch.int16))
+    next_weight.clamp_(-127, 127)
+    int_weight.copy_(next_weight.to(torch.int8))

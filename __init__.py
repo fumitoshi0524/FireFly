@@ -1,4 +1,4 @@
-from .fireflykernels import pack_ternary_weight
+from .fireflykernels import quantize_fp_to_int8
 from .bitLinear import BitLinear, collect_bitlinear_modules
 from .fireflyoptim import FireFlyOptim
 
@@ -6,5 +6,5 @@ __all__ = [
     "BitLinear",
     "FireFlyOptim",
     "collect_bitlinear_modules",
-    "pack_ternary_weight",
+    "quantize_fp_to_int8",
 ]
