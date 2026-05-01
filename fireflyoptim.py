@@ -2,7 +2,7 @@ import torch
 from torch.optim import Optimizer
 
 from .bitLinear import BitLinear
-from .fireflykernels import update_int8_weight_
+from .fireflykernels import update_int8_weight_, _invalidate_weight_cache
 
 
 def _pad_to_block_multiple(t: torch.Tensor, blocksize: int, num_blocks: int):
@@ -232,6 +232,7 @@ class FireFlyOptim(Optimizer):
                 if torch.any(delta_q_i32 != 0):
                     update_int8_weight_(module.int_weight, delta_q_i32)
                     residual.sub_(delta_q_i32.float())
+                    _invalidate_weight_cache(handle)
 
                 if use_8bit:
                     m_q, m_absmax = _quantize_blockwise_signed(m, block_size)

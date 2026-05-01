@@ -1,14 +1,12 @@
 import torch
-import importlib
-import warnings
 
 
+# ---------------------------------------------------------------------------
+# Handle registry
+# ---------------------------------------------------------------------------
 _NEXT_HANDLE = 1
 _REGISTERED_HANDLES: set[int] = set()
 _BIT_GRAD_CACHE: dict[int, torch.Tensor] = {}
-_FF_EXT = False
-_EXT_CANDIDATES = ("firefly_int8_ext", "firefly_bitnet_ext")
-_EXT_WARNED = False
 
 
 def next_bit_handle() -> int:
@@ -43,26 +41,59 @@ def consume_bit_grad(handle: int) -> torch.Tensor | None:
     return _BIT_GRAD_CACHE.pop(int(handle), None)
 
 
-def _get_firefly_ext():
-    global _FF_EXT, _EXT_WARNED
-    if _FF_EXT is not False:
-        return _FF_EXT
-    for mod_name in _EXT_CANDIDATES:
-        try:
-            _FF_EXT = importlib.import_module(mod_name)
-            break
-        except Exception:
-            _FF_EXT = None
-    if _FF_EXT is None and not _EXT_WARNED:
-        _EXT_WARNED = True
-        warnings.warn(
-            "firefly_int8_ext is unavailable; falling back to Python INT8 kernels.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    return _FF_EXT
+# ---------------------------------------------------------------------------
+# bitsandbytes backend
+# ---------------------------------------------------------------------------
+_BNB = None
+_BNB_F = None
+_BNB_FMT = "col_ampere"
+
+try:
+    import bitsandbytes as _BNB
+    import bitsandbytes.functional as _BNB_F
+    if torch.cuda.is_available():
+        cc = torch.cuda.get_device_capability()
+        if cc[0] >= 8:
+            _BNB_FMT = "col_ampere"
+        elif cc[0] == 7 and cc[1] >= 5:
+            _BNB_FMT = "col_turing"
+        else:
+            _BNB_FMT = "col32"
+except ImportError:
+    pass
+
+# Weight-transform cache  (handle → (CxB, SB, version))
+_BNB_WCACHE: dict[int, tuple] = {}
+_BNB_WVERSION: dict[int, int] = {}
 
 
+def _cached_weight_transform(
+    handle: int, int_weight: torch.Tensor, weight_scale: torch.Tensor
+):
+    """Return (CxB, SB) for the current weight; re-transform only if stale."""
+    cur_ver = _BNB_WVERSION.get(handle, 0)
+    entry = _BNB_WCACHE.get(handle)
+    if entry is not None:
+        CxB, SB, cached_ver = entry
+        if cached_ver == cur_ver:
+            return CxB, SB
+
+    # bitsandbytes expects fp16 input for int8_vectorwise_quant
+    w_fp16 = int_weight.to(torch.float16) * weight_scale.to(torch.float16).unsqueeze(1)
+    w_q, _w_s = _BNB_F.int8_vectorwise_quant(w_fp16)
+    CxB, SB = _BNB_F.transform(w_q, _BNB_FMT)
+    _BNB_WCACHE[handle] = (CxB, SB, cur_ver)
+    return CxB, SB
+
+
+def _invalidate_weight_cache(handle: int):
+    """Call after int_weight is modified by stochastic rounding."""
+    _BNB_WVERSION[handle] = _BNB_WVERSION.get(handle, 0) + 1
+
+
+# ---------------------------------------------------------------------------
+# Weight quantisation  (static, used at init / reset)
+# ---------------------------------------------------------------------------
 def quantize_fp_to_int8(weight: torch.Tensor, eps: float = 1e-8):
     if weight.ndim != 2:
         raise ValueError(
@@ -75,100 +106,163 @@ def quantize_fp_to_int8(weight: torch.Tensor, eps: float = 1e-8):
 
 
 # ---------------------------------------------------------------------------
-#  bitsandbytes-style:  INT8 weight storage  +  BF16 Tensor-Core compute
-#
-#  int_weight (int8) is the only source of truth — no shadow weights.
-#  Dequantised to bf16 on-the-fly; all three matmuls (fwd, grad_in, grad_w)
-#  run on BF16 Tensor Cores via torch.matmul (cuBLAS).
-#
-#  Memory:  x2d (bf16) + int_weight (int8) saved for backward.
-#           w_bf16 is recomputed in backward from int_weight + weight_scale
-#           (int8→bf16 conversion is cheap, saves ~1.1 GB cached bf16 weights).
+# Int8LinearFn
 # ---------------------------------------------------------------------------
-
 class Int8LinearFn(torch.autograd.Function):
 
     @staticmethod
     def forward(
         ctx,
-        x2d: torch.Tensor,          # [N, K]  bf16  (from autocast)
-        int_weight: torch.Tensor,   # [O, K]  int8  (buffer, no grad)
-        weight_scale: torch.Tensor, # [O]     float (trainable Parameter)
+        x2d: torch.Tensor,          # [N, K]  (autocast doesn't cover custom Fns)
+        int_weight: torch.Tensor,   # [O, K]  int8
+        weight_scale: torch.Tensor, # [O]     float  (trainable Parameter)
         bias: torch.Tensor | None,  # [O]     float
         handle: int,
     ):
-        # Dequant int8 → bf16  (transient compute cache, not a shadow weight)
-        w_bf16 = int_weight.to(torch.bfloat16) * weight_scale.to(torch.bfloat16).unsqueeze(1)
-
-        # Forward: BF16 Tensor-Core matmul via cuBLAS
-        out = torch.matmul(x2d, w_bf16.t())
-        if bias is not None:
-            out.add_(bias)
-
-        ctx.save_for_backward(x2d, int_weight, weight_scale)
-        ctx.handle = int(handle)
-        ctx.has_bias = bias is not None
-        return out
+        if _BNB_F is not None:
+            return _forward_bnb(ctx, x2d, int_weight, weight_scale, bias, handle)
+        return _forward_bf16(ctx, x2d, int_weight, weight_scale, bias, handle)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x2d, int_weight, weight_scale = ctx.saved_tensors
+        if _BNB_F is not None:
+            return _backward_bnb(ctx, grad_out)
+        return _backward_bf16(ctx, grad_out)
 
-        # Cast to bf16 for Tensor-Core matmul
-        go_bf16 = grad_out.contiguous().to(torch.bfloat16)
-        x2d_bf16 = x2d.to(torch.bfloat16)
 
-        # Recompute bf16 weight (cheap: int8→bf16 convert + element-wise scale)
-        w_bf16 = int_weight.to(torch.bfloat16) * weight_scale.to(torch.bfloat16).unsqueeze(1)
+# ---------------------------------------------------------------------------
+# Path A: bitsandbytes cuBLASLt INT8 Tensor Cores
+# ---------------------------------------------------------------------------
 
-        # grad_in  = grad_out @ W          BF16 Tensor Cores
-        grad_in_bf16 = torch.matmul(go_bf16, w_bf16)
+def _forward_bnb(ctx, x2d, int_weight, weight_scale, bias, handle):
+    # 1. Quantise activation — bitsandbytes works in fp16
+    x_fp16 = x2d.half()
+    CA, SCA = _BNB_F.int8_vectorwise_quant(x_fp16)
 
-        # grad_w   = grad_out^T @ x2d      BF16 Tensor Cores
-        grad_w = torch.matmul(go_bf16.t(), x2d_bf16)
-        cached = _BIT_GRAD_CACHE.get(ctx.handle)
-        if cached is None:
-            _BIT_GRAD_CACHE[ctx.handle] = grad_w.to(dtype=torch.bfloat16)
-        else:
-            cached.add_(grad_w.to(dtype=torch.bfloat16))
+    # 2. Transform activation to col32 layout
+    C32A, SA = _BNB_F.transform(CA, "col32")
 
-        # grad_weight_scale  =  (grad_w ⊙ int_weight) · 1_row
-        #   ∂W_bf16/∂weight_scale[i] = int_weight[i,:]
-        #   ∂loss/∂weight_scale[i]   = Σ_j grad_w[i,j] * int_weight[i,j]
-        grad_weight_scale = (
-            grad_w.float() * int_weight.float()
-        ).sum(dim=1).to(dtype=weight_scale.dtype)
+    # 3. Get cached weight transform
+    CxB, SB = _cached_weight_transform(handle, int_weight, weight_scale)
 
-        grad_bias = go_bf16.sum(dim=0).to(dtype=grad_out.dtype) if ctx.has_bias else None
+    # 4. INT8 matmul via cuBLASLt
+    out_i32, _ = _BNB_F.igemmlt(C32A, CxB, SA, SB)
 
-        return (
-            grad_in_bf16.to(dtype=grad_out.dtype),  # x2d
-            None,               # int_weight (buffer, gradient via cache)
-            grad_weight_scale,  # weight_scale (trainable Parameter)
-            grad_bias,          # bias
-            None,               # handle
-        )
+    # 5. Dequantise — output must match activation scale × weight scale
+    out = _BNB_F.mm_dequant(out_i32, SCA, weight_scale.half().unsqueeze(1))
 
+    if bias is not None:
+        out.add_(bias.half())
+
+    # Save quantised activation for backward
+    ctx.save_for_backward(CA, SCA, int_weight, weight_scale)
+    ctx.handle = int(handle)
+    ctx.has_bias = bias is not None
+    ctx.input_dtype = x2d.dtype
+    return out.to(dtype=x2d.dtype)
+
+
+def _backward_bnb(ctx, grad_out):
+    CA, SCA, int_weight, weight_scale = ctx.saved_tensors
+    go_fp16 = grad_out.half()
+    ws_fp16 = weight_scale.half()
+    handle = ctx.handle
+
+    CxB, SB = _cached_weight_transform(handle, int_weight, weight_scale)
+
+    # --- grad_in = grad_out @ W  (use igemmlt with same weight layout) ---
+    Cgo, SCgo = _BNB_F.int8_vectorwise_quant(go_fp16)
+    C32go, Sgo = _BNB_F.transform(Cgo, "col32")
+    grad_in_i32, _ = _BNB_F.igemmlt(C32go, CxB, Sgo, SB)
+    grad_in = _BNB_F.mm_dequant(grad_in_i32, SCgo, ws_fp16.unsqueeze(0))
+
+    # --- grad_w = grad_out^T @ x  (swap operands: x_q as A, go as B) ---
+    # Save x_q (int8) from forward → transform, then igemmlt(go_col32, xq_col32, transposed_B=True)
+    C32x, Sx = _BNB_F.transform(CA, "col32")  # CA is the saved int8 activation
+
+    Cg2, SCg2 = _BNB_F.int8_vectorwise_quant(go_fp16)
+    C32g2, Sg2 = _BNB_F.transform(Cg2, "col32")
+
+    grad_w_i32, _ = _BNB_F.igemmlt(C32g2, C32x, Sg2, Sx)
+    grad_w = _BNB_F.mm_dequant(grad_w_i32, SCg2, SCA)
+
+    cached = _BIT_GRAD_CACHE.get(handle)
+    if cached is None:
+        _BIT_GRAD_CACHE[handle] = grad_w.to(dtype=torch.bfloat16)
+    else:
+        cached.add_(grad_w.to(dtype=torch.bfloat16))
+
+    # --- grad_weight_scale  =  (grad_w ⊙ int_weight).sum(dim=1) ---
+    grad_weight_scale = (
+        grad_w.float() * int_weight.float()
+    ).sum(dim=1).to(dtype=weight_scale.dtype)
+
+    grad_bias = go_fp16.sum(dim=0).to(dtype=grad_out.dtype) if ctx.has_bias else None
+
+    return (
+        grad_in.to(dtype=grad_out.dtype),
+        None,
+        grad_weight_scale,
+        grad_bias,
+        None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Path B: BF16 fallback  (torch.matmul on BF16 Tensor Cores, works everywhere)
+# ---------------------------------------------------------------------------
+
+def _forward_bf16(ctx, x2d, int_weight, weight_scale, bias, handle):
+    x2d_bf16 = x2d.to(torch.bfloat16)
+    w_bf16 = int_weight.to(torch.bfloat16) * weight_scale.to(torch.bfloat16).unsqueeze(1)
+    out = torch.matmul(x2d_bf16, w_bf16.t())
+    if bias is not None:
+        out.add_(bias)
+    ctx.save_for_backward(x2d_bf16, int_weight, weight_scale)
+    ctx.handle = int(handle)
+    ctx.has_bias = bias is not None
+    ctx.input_dtype = x2d.dtype
+    return out
+
+
+def _backward_bf16(ctx, grad_out):
+    x2d_bf16, int_weight, weight_scale = ctx.saved_tensors
+    go_bf16 = grad_out.to(torch.bfloat16)
+    ws_bf16 = weight_scale.to(torch.bfloat16)
+
+    w_bf16 = int_weight.to(torch.bfloat16) * ws_bf16.unsqueeze(1)
+
+    grad_in = torch.matmul(go_bf16, w_bf16)
+
+    grad_w = torch.matmul(go_bf16.t(), x2d_bf16)
+    cached = _BIT_GRAD_CACHE.get(ctx.handle)
+    if cached is None:
+        _BIT_GRAD_CACHE[ctx.handle] = grad_w.to(dtype=torch.bfloat16)
+    else:
+        cached.add_(grad_w.to(dtype=torch.bfloat16))
+
+    grad_weight_scale = (
+        grad_w.float() * int_weight.float()
+    ).sum(dim=1).to(dtype=weight_scale.dtype)
+
+    grad_bias = go_bf16.sum(dim=0).to(dtype=grad_out.dtype) if ctx.has_bias else None
+
+    return (
+        grad_in.to(dtype=grad_out.dtype),
+        None,
+        grad_weight_scale,
+        grad_bias,
+        None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# INT8 weight update
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def update_int8_weight_(int_weight: torch.Tensor, delta_q: torch.Tensor) -> None:
-    if int_weight.dtype != torch.int8:
-        raise TypeError(f"int_weight must be torch.int8, got {int_weight.dtype}")
-    if delta_q.shape != int_weight.shape:
-        raise ValueError(
-            f"delta_q shape mismatch: expected {tuple(int_weight.shape)}, got {tuple(delta_q.shape)}"
-        )
-    ext = _get_firefly_ext()
-    if ext is not None and hasattr(ext, "ff_int8_weight_update_"):
-        ext.ff_int8_weight_update_(
-            int_weight.contiguous(), delta_q.to(torch.int32).contiguous()
-        )
-        return
-    if int_weight.is_cuda:
-        raise RuntimeError(
-            "INT8 CUDA optimizer kernel is required but not loaded. "
-            "Build and load firefly_bitnet_ext (ff_int8_weight_update_)."
-        )
-    next_weight = int_weight.to(torch.int16).add_(delta_q.to(torch.int16))
-    next_weight.clamp_(-127, 127)
-    int_weight.copy_(next_weight.to(torch.int8))
+    """In-place int8 weight update:  W += delta_q, clamped to [-127, 127]."""
+    result = int_weight.to(torch.int16) + delta_q.to(torch.int16)
+    result.clamp_(-127, 127)
+    int_weight.copy_(result.to(torch.int8))
