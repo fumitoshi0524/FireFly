@@ -5,61 +5,69 @@ from .bitLinear import BitLinear
 from .fireflykernels import update_int8_weight_
 
 
+def _pad_to_block_multiple(t: torch.Tensor, blocksize: int, num_blocks: int):
+    """Pad 1-D tensor to num_blocks * blocksize with zeros."""
+    padded_size = num_blocks * blocksize
+    if padded_size > t.numel():
+        return torch.cat(
+            [
+                t,
+                torch.zeros(padded_size - t.numel(), device=t.device, dtype=t.dtype),
+            ]
+        )
+    return t
+
+
 def _quantize_blockwise_signed(x: torch.Tensor, blocksize: int):
     x_flat = x.float().contiguous().view(-1)
-    q = torch.empty_like(x_flat, dtype=torch.uint8)
-    blocks = (x_flat.numel() + blocksize - 1) // blocksize
-    absmax = torch.empty((blocks,), device=x.device, dtype=torch.float32)
-    for b in range(blocks):
-        start = b * blocksize
-        end = min(start + blocksize, x_flat.numel())
-        block = x_flat[start:end]
-        amax = block.abs().max().clamp_min(1e-12)
-        absmax[b] = amax
-        q_block = torch.round(block / amax * 127.0).clamp(-127, 127).to(torch.int16)
-        q[start:end] = (q_block + 128).to(torch.uint8)
-    return q.view_as(x), absmax
+    numel = x_flat.numel()
+    num_blocks = (numel + blocksize - 1) // blocksize
+    x_padded = _pad_to_block_multiple(x_flat, blocksize, num_blocks)
+    x_blocks = x_padded.view(num_blocks, blocksize)
+    absmax = x_blocks.abs().amax(dim=1).clamp_min(1e-12)
+    q_blocks = (
+        torch.round(x_blocks / absmax.unsqueeze(1) * 127.0)
+        .clamp(-127, 127)
+        .to(torch.int16)
+    )
+    q_flat = (q_blocks.view(-1)[:numel] + 128).to(torch.uint8)
+    return q_flat.view_as(x), absmax
 
 
 def _dequantize_blockwise_signed(
     q: torch.Tensor, absmax: torch.Tensor, blocksize: int, shape
 ) -> torch.Tensor:
     q_flat = q.contiguous().view(-1)
-    out = torch.empty((q_flat.numel(),), device=q.device, dtype=torch.float32)
-    for b in range(absmax.numel()):
-        start = b * blocksize
-        end = min(start + blocksize, q_flat.numel())
-        block = q_flat[start:end].float()
-        out[start:end] = ((block - 128.0) / 127.0) * absmax[b]
-    return out.view(shape)
+    numel = q_flat.numel()
+    num_blocks = absmax.numel()
+    q_padded = _pad_to_block_multiple(q_flat, blocksize, num_blocks)
+    q_blocks = q_padded.view(num_blocks, blocksize).float()
+    out_blocks = ((q_blocks - 128.0) / 127.0) * absmax.unsqueeze(1)
+    return out_blocks.view(-1)[:numel].view(shape)
 
 
 def _quantize_blockwise_unsigned(x: torch.Tensor, blocksize: int):
     x_flat = x.float().contiguous().view(-1)
-    q = torch.empty_like(x_flat, dtype=torch.uint8)
-    blocks = (x_flat.numel() + blocksize - 1) // blocksize
-    absmax = torch.empty((blocks,), device=x.device, dtype=torch.float32)
-    for b in range(blocks):
-        start = b * blocksize
-        end = min(start + blocksize, x_flat.numel())
-        block = x_flat[start:end]
-        amax = block.max().clamp_min(1e-12)
-        absmax[b] = amax
-        q[start:end] = torch.round(block / amax * 255.0).clamp(0, 255).to(torch.uint8)
-    return q.view_as(x), absmax
+    numel = x_flat.numel()
+    num_blocks = (numel + blocksize - 1) // blocksize
+    x_padded = _pad_to_block_multiple(x_flat, blocksize, num_blocks)
+    x_blocks = x_padded.view(num_blocks, blocksize)
+    absmax = x_blocks.amax(dim=1).clamp_min(1e-12)
+    q_blocks = torch.round(x_blocks / absmax.unsqueeze(1) * 255.0).clamp(0, 255)
+    q_flat = q_blocks.view(-1)[:numel].to(torch.uint8)
+    return q_flat.view_as(x), absmax
 
 
 def _dequantize_blockwise_unsigned(
     q: torch.Tensor, absmax: torch.Tensor, blocksize: int, shape
 ) -> torch.Tensor:
     q_flat = q.contiguous().view(-1)
-    out = torch.empty((q_flat.numel(),), device=q.device, dtype=torch.float32)
-    for b in range(absmax.numel()):
-        start = b * blocksize
-        end = min(start + blocksize, q_flat.numel())
-        block = q_flat[start:end].float()
-        out[start:end] = (block / 255.0) * absmax[b]
-    return out.view(shape)
+    numel = q_flat.numel()
+    num_blocks = absmax.numel()
+    q_padded = _pad_to_block_multiple(q_flat, blocksize, num_blocks)
+    q_blocks = q_padded.view(num_blocks, blocksize).float()
+    out_blocks = (q_blocks / 255.0) * absmax.unsqueeze(1)
+    return out_blocks.view(-1)[:numel].view(shape)
 
 
 class FireFlyOptim(Optimizer):
