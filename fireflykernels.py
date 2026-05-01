@@ -81,6 +81,19 @@ def _quantize_activation_per_token(x2d: torch.Tensor, eps: float = 1e-8):
     return q.contiguous(), scale.contiguous()
 
 
+def _int8_linear_i32(
+    x_q: torch.Tensor, int_weight: torch.Tensor, ext
+) -> torch.Tensor:
+    if ext is not None and hasattr(ext, "ff_int8_linear_forward"):
+        return ext.ff_int8_linear_forward(x_q.contiguous(), int_weight.contiguous())
+    if x_q.is_cuda:
+        raise RuntimeError(
+            "INT8 CUDA kernel is required but not loaded. "
+            "Build and load firefly_bitnet_ext (ff_int8_linear_forward)."
+        )
+    return x_q.to(torch.int32).matmul(int_weight.to(torch.int32).t())
+
+
 class Int8LinearFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -95,21 +108,13 @@ class Int8LinearFn(torch.autograd.Function):
         ext = _get_firefly_ext()
         x_saved = x2d.contiguous().float()
         x_q, x_scale = _quantize_activation_per_token(x_saved)
-        if ext is not None and hasattr(ext, "ff_int8_linear_forward"):
-            out_i32 = ext.ff_int8_linear_forward(x_q.contiguous(), int_weight.contiguous())
-        else:
-            if x_q.is_cuda:
-                raise RuntimeError(
-                    "INT8 CUDA kernel is required but not loaded. "
-                    "Build and load firefly_bitnet_ext (ff_int8_linear_forward)."
-                )
-            out_i32 = x_q.to(torch.int32).matmul(int_weight.to(torch.int32).t())
+        out_i32 = _int8_linear_i32(x_q, int_weight, ext)
         out = out_i32.float() * (x_scale * weight_scale.float().view(1, -1))
         out.mul_(channel_scale.float().view(1, -1))
         if bias is not None:
             out.add_(bias.float().view(1, -1))
 
-        ctx.save_for_backward(x_saved, int_weight, weight_scale, channel_scale)
+        ctx.save_for_backward(x_q, x_scale, int_weight, weight_scale, channel_scale)
         ctx.handle = int(handle)
         ctx.input_dtype = x2d.dtype
         ctx.has_bias = bias is not None
@@ -118,7 +123,7 @@ class Int8LinearFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         ext = _get_firefly_ext()
-        x_saved, int_weight, weight_scale, channel_scale = ctx.saved_tensors
+        x_q, x_scale, int_weight, weight_scale, channel_scale = ctx.saved_tensors
         grad_out_f32 = grad_out.contiguous().float()
 
         if ext is not None and hasattr(ext, "ff_int8_linear_backward_input"):
@@ -129,14 +134,17 @@ class Int8LinearFn(torch.autograd.Function):
                 channel_scale.float().contiguous(),
             )
         else:
-            w_deq = int_weight.float() * weight_scale.float().unsqueeze(1)
-            w_eff = w_deq * channel_scale.float().unsqueeze(1)
-            grad_in = grad_out_f32.matmul(w_eff)
+            ws_cs = (weight_scale.float() * channel_scale.float()).view(1, -1)
+            go_q, go_scale = _quantize_activation_per_token(grad_out_f32 * ws_cs)
+            grad_in_i32 = go_q.to(torch.int32).matmul(int_weight.to(torch.int32))
+            grad_in = grad_in_i32.float() * go_scale
 
         if ext is not None and hasattr(ext, "ff_int8_linear_backward_weight"):
-            grad_w = ext.ff_int8_linear_backward_weight(grad_out_f32, x_saved)
+            grad_w = ext.ff_int8_linear_backward_weight(
+                grad_out_f32, x_q.float() * x_scale
+            )
         else:
-            grad_w = grad_out_f32.t().matmul(x_saved)
+            grad_w = grad_out_f32.t().matmul(x_q.float() * x_scale)
         grad_w.mul_(channel_scale.float().unsqueeze(1))
         cached = _BIT_GRAD_CACHE.get(ctx.handle)
         if cached is None:
@@ -144,8 +152,8 @@ class Int8LinearFn(torch.autograd.Function):
         else:
             cached.add_(grad_w.to(dtype=torch.bfloat16))
 
-        w_deq = int_weight.float() * weight_scale.float().unsqueeze(1)
-        pre_channel = x_saved.matmul(w_deq.t())
+        pre_i32 = _int8_linear_i32(x_q, int_weight, ext)
+        pre_channel = pre_i32.float() * (x_scale * weight_scale.float().view(1, -1))
         grad_channel_scale = (grad_out_f32 * pre_channel).sum(dim=0).to(
             dtype=channel_scale.dtype
         )

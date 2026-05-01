@@ -90,6 +90,11 @@ class FireFlyOptim(Optimizer):
         )
         super().__init__(params, defaults)
         self.bit_modules = list(bit_modules) if bit_modules is not None else []
+        self._bit_handles = (
+            [int(m._bit_handle.item()) for m in self.bit_modules]
+            if bit_modules is not None
+            else []
+        )
         self._bit_state: dict[int, dict[str, torch.Tensor | int]] = {}
 
     def add_bit_modules(self, modules) -> None:
@@ -98,6 +103,7 @@ class FireFlyOptim(Optimizer):
                 raise TypeError(f"expected BitLinear, got {type(module).__name__}")
             if module not in self.bit_modules:
                 self.bit_modules.append(module)
+                self._bit_handles.append(int(module._bit_handle.item()))
 
     def _init_8bit_state(self, target: torch.Tensor, block_size: int):
         m_q, m_absmax = _quantize_blockwise_signed(
@@ -175,13 +181,11 @@ class FireFlyOptim(Optimizer):
             min_8bit_size = int(cfg["min_8bit_size"])
             block_size = int(cfg["block_size"])
 
-            for module in self.bit_modules:
+            for module, handle in zip(self.bit_modules, self._bit_handles):
                 g = module.consume_weight_grad()
                 if g is None:
                     continue
                 g = g.float().contiguous()
-
-                handle = int(module._bit_handle.item())
                 state = self._bit_state.setdefault(handle, {})
                 if "residual" not in state or state["residual"].shape != g.shape:
                     state["residual"] = torch.zeros_like(g, dtype=torch.float32)
