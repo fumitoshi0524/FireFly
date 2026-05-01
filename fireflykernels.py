@@ -81,17 +81,17 @@ def _quantize_activation_per_token(x2d: torch.Tensor, eps: float = 1e-8):
     return q.contiguous(), scale.contiguous()
 
 
-def _int8_linear_i32(
-    x_q: torch.Tensor, int_weight: torch.Tensor, ext
-) -> torch.Tensor:
-    if ext is not None and hasattr(ext, "ff_int8_linear_forward"):
-        return ext.ff_int8_linear_forward(x_q.contiguous(), int_weight.contiguous())
-    if x_q.is_cuda:
-        raise RuntimeError(
-            "INT8 CUDA kernel is required but not loaded. "
-            "Build and load firefly_bitnet_ext (ff_int8_linear_forward)."
-        )
-    return x_q.to(torch.int32).matmul(int_weight.to(torch.int32).t())
+def _quantize_per_column(x2d: torch.Tensor, eps: float = 1e-8):
+    """Per-column (per output-channel) quantisation for bitsandbytes outer-product dequant."""
+    x = x2d.float()
+    scale = x.abs().amax(dim=0, keepdim=True).clamp_min(float(eps)) / 127.0
+    q = torch.round(x / scale).clamp(-127, 127).to(torch.int8)
+    return q.contiguous(), scale.contiguous()  # q: [N, C]  scale: [1, C]
+
+
+def _col_stats_from_row_quant(q_i8: torch.Tensor, eps: float = 1e-8):
+    """Estimate per-column max-abs from a row-wise quantised int8 tensor."""
+    return q_i8.float().abs().amax(dim=0).clamp_min(float(eps)) / 127.0  # [ncol]
 
 
 class Int8LinearFn(torch.autograd.Function):
@@ -101,20 +101,22 @@ class Int8LinearFn(torch.autograd.Function):
         x2d: torch.Tensor,
         int_weight: torch.Tensor,
         weight_scale: torch.Tensor,
-        channel_scale: torch.Tensor,
         bias: torch.Tensor | None,
         handle: int,
     ):
-        ext = _get_firefly_ext()
         x_saved = x2d.contiguous().float()
         x_q, x_scale = _quantize_activation_per_token(x_saved)
-        out_i32 = _int8_linear_i32(x_q, int_weight, ext)
+        # Pure int8 matmul → int32 output.  No weight dequant.
+        out_i32 = x_q.to(torch.int32).matmul(int_weight.to(torch.int32).t())
+        # Dequant output only for the next layer (RMSNorm / attention need float).
         out = out_i32.float() * (x_scale * weight_scale.float().view(1, -1))
-        out.mul_(channel_scale.float().view(1, -1))
         if bias is not None:
             out.add_(bias.float().view(1, -1))
 
-        ctx.save_for_backward(x_q, x_scale, int_weight, weight_scale, channel_scale)
+        # Save only integer tensors + float scales.
+        ctx.save_for_backward(
+            x_q, x_scale, int_weight, weight_scale, out_i32,
+        )
         ctx.handle = int(handle)
         ctx.input_dtype = x2d.dtype
         ctx.has_bias = bias is not None
@@ -122,51 +124,49 @@ class Int8LinearFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        ext = _get_firefly_ext()
-        x_q, x_scale, int_weight, weight_scale, channel_scale = ctx.saved_tensors
+        x_q, x_scale, int_weight, weight_scale, out_i32 = ctx.saved_tensors
         grad_out_f32 = grad_out.contiguous().float()
+        ws_f32 = weight_scale.float()
 
-        if ext is not None and hasattr(ext, "ff_int8_linear_backward_input"):
-            grad_in = ext.ff_int8_linear_backward_input(
-                grad_out_f32,
-                int_weight.contiguous(),
-                weight_scale.float().contiguous(),
-                channel_scale.float().contiguous(),
-            )
-        else:
-            ws_cs = (weight_scale.float() * channel_scale.float()).view(1, -1)
-            go_q, go_scale = _quantize_activation_per_token(grad_out_f32 * ws_cs)
-            grad_in_i32 = go_q.to(torch.int32).matmul(int_weight.to(torch.int32))
-            grad_in = grad_in_i32.float() * go_scale
+        # -- grad_in (backward input) -------------------------------------------
+        #   grad_in = (grad_out · weight_scale) @ int_weight
+        #   Per-token quantise grad_out, int8 matmul, dequant only the result.
+        go_q, go_scale = _quantize_activation_per_token(
+            grad_out_f32 * ws_f32.view(1, -1)
+        )
+        grad_in_i32 = go_q.to(torch.int32).matmul(int_weight.to(torch.int32))
+        grad_in = grad_in_i32.float() * go_scale
 
-        if ext is not None and hasattr(ext, "ff_int8_linear_backward_weight"):
-            grad_w = ext.ff_int8_linear_backward_weight(
-                grad_out_f32, x_q.float() * x_scale
-            )
-        else:
-            grad_w = grad_out_f32.t().matmul(x_q.float() * x_scale)
-        grad_w.mul_(channel_scale.float().unsqueeze(1))
+        # -- grad_w (int8 weight gradient) --------------------------------------
+        #   bitsandbytes-style: per-OUTPUT-channel quantise grad_out,
+        #   per-INPUT-channel stats from x_q, outer-product dequant.
+        go_pc_q, go_pc_scale = _quantize_per_column(
+            grad_out_f32 * ws_f32.view(1, -1)
+        )
+        x_col_scale = _col_stats_from_row_quant(x_q)
+        grad_w_i32 = go_pc_q.t().to(torch.int32).matmul(x_q.to(torch.int32))
+        grad_w = grad_w_i32.float() * go_pc_scale.t() * x_col_scale.view(1, -1)
         cached = _BIT_GRAD_CACHE.get(ctx.handle)
         if cached is None:
             _BIT_GRAD_CACHE[ctx.handle] = grad_w.to(dtype=torch.bfloat16)
         else:
             cached.add_(grad_w.to(dtype=torch.bfloat16))
 
-        pre_i32 = _int8_linear_i32(x_q, int_weight, ext)
-        pre_channel = pre_i32.float() * (x_scale * weight_scale.float().view(1, -1))
-        grad_channel_scale = (grad_out_f32 * pre_channel).sum(dim=0).to(
-            dtype=channel_scale.dtype
-        )
+        # -- grad_weight_scale (now a trainable Parameter) -----------------------
+        #   out = out_i32 · x_scale · weight_scale
+        #   ∂out/∂weight_scale = out_i32 · x_scale
+        grad_weight_scale = (
+            grad_out_f32 * out_i32.float() * x_scale
+        ).sum(dim=0).to(dtype=weight_scale.dtype)
         grad_bias = (
             grad_out_f32.sum(dim=0).to(dtype=grad_out.dtype) if ctx.has_bias else None
         )
         return (
             grad_in.to(dtype=ctx.input_dtype),
-            None,
-            None,
-            grad_channel_scale,
+            None,              # int_weight — buffer, no gradient
+            grad_weight_scale, # weight_scale — now a trainable Parameter
             grad_bias,
-            None,
+            None,              # handle
         )
 
 

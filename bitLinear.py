@@ -43,7 +43,7 @@ class BitLinear(nn.Module):
             int_init,
             persistent=True,
         )
-        self.register_buffer("weight_scale", scale_init, persistent=True)
+        self.weight_scale = nn.Parameter(scale_init)
         self.register_buffer(
             "_bit_handle",
             torch.tensor(next_bit_handle(), dtype=torch.int64),
@@ -51,7 +51,6 @@ class BitLinear(nn.Module):
         )
         self._registered_handle = int(self._bit_handle.item())
         self.register_load_state_dict_post_hook(self._post_load_state_dict)
-        self.channel_scale = nn.Parameter(torch.ones(out_features))
 
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
@@ -81,7 +80,6 @@ class BitLinear(nn.Module):
             x2d,
             self.int_weight,
             self.weight_scale,
-            self.channel_scale,
             self.bias,
             int(self._bit_handle.item()),
         )

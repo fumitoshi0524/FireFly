@@ -77,6 +77,7 @@ class FireFlyOptim(Optimizer):
         lr_int8=0.01,
         lr_dense=1e-3,
         clip_grad=1.0,
+        theta=0.0,
         bit_modules=None,
         min_8bit_size=4096,
         block_size=256,
@@ -85,6 +86,7 @@ class FireFlyOptim(Optimizer):
             lr_int8=float(lr_int8),
             lr_dense=float(lr_dense),
             clip_grad=float(clip_grad),
+            theta=float(theta),
             min_8bit_size=int(min_8bit_size),
             block_size=int(block_size),
         )
@@ -181,6 +183,8 @@ class FireFlyOptim(Optimizer):
             min_8bit_size = int(cfg["min_8bit_size"])
             block_size = int(cfg["block_size"])
 
+            theta = float(cfg.get("theta", 0.0))
+
             for module, handle in zip(self.bit_modules, self._bit_handles):
                 g = module.consume_weight_grad()
                 if g is None:
@@ -217,7 +221,8 @@ class FireFlyOptim(Optimizer):
 
                 adam_step = -lr_int8 * (m_hat / (v_hat.sqrt() + eps))
                 denom = module.weight_scale.float().unsqueeze(1).clamp_min(eps)
-                residual.add_(adam_step / denom)
+                # OU mean reversion: residual pulled toward zero at rate theta
+                residual.mul_(1.0 - theta).add_(adam_step / denom)
 
                 abs_res = residual.abs()
                 base = torch.floor(abs_res)
