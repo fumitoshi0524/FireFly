@@ -94,6 +94,40 @@ def _col_stats_from_row_quant(q_i8: torch.Tensor, eps: float = 1e-8):
     return q_i8.float().abs().amax(dim=0).clamp_min(float(eps)) / 127.0  # [ncol]
 
 
+def _int8_gemm_forward(
+    x_q: torch.Tensor,      # [M, K] int8
+    int_weight: torch.Tensor # [N, K] int8
+) -> torch.Tensor:
+    """x_q @ int_weight^T  →  [M, N] int32  (cuBLASLt on CUDA, torch on CPU)."""
+    ext = _get_firefly_ext()
+    if ext is not None and hasattr(ext, "ff_int8_linear_forward"):
+        return ext.ff_int8_linear_forward(x_q.contiguous(), int_weight.contiguous())
+    # CPU fallback
+    return x_q.to(torch.int32).matmul(int_weight.to(torch.int32).t())
+
+
+def _int8_gemm_backward_input(
+    go_q: torch.Tensor,     # [M, N] int8
+    int_weight: torch.Tensor # [N, K] int8
+) -> torch.Tensor:
+    """go_q @ int_weight  →  [M, K] int32."""
+    ext = _get_firefly_ext()
+    if ext is not None and hasattr(ext, "ff_int8_linear_backward_input"):
+        return ext.ff_int8_linear_backward_input(go_q.contiguous(), int_weight.contiguous())
+    return go_q.to(torch.int32).matmul(int_weight.to(torch.int32))
+
+
+def _int8_gemm_backward_weight(
+    go_pc_q: torch.Tensor,  # [M, N] int8
+    x_q: torch.Tensor       # [M, K] int8
+) -> torch.Tensor:
+    """go_pc_q^T @ x_q  →  [N, K] int32."""
+    ext = _get_firefly_ext()
+    if ext is not None and hasattr(ext, "ff_int8_linear_backward_weight"):
+        return ext.ff_int8_linear_backward_weight(go_pc_q.contiguous(), x_q.contiguous())
+    return go_pc_q.t().to(torch.int32).matmul(x_q.to(torch.int32))
+
+
 class Int8LinearFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -106,8 +140,8 @@ class Int8LinearFn(torch.autograd.Function):
     ):
         x_saved = x2d.contiguous().float()
         x_q, x_scale = _quantize_activation_per_token(x_saved)
-        # Pure int8 matmul → int32 output.  No weight dequant.
-        out_i32 = x_q.to(torch.int32).matmul(int_weight.to(torch.int32).t())
+        # int8 GEMM via cuBLASLt (CUDA) or torch (CPU).  No weight dequant.
+        out_i32 = _int8_gemm_forward(x_q, int_weight)
         # Dequant output only for the next layer (RMSNorm / attention need float).
         out = out_i32.float() * (x_scale * weight_scale.float().view(1, -1))
         if bias is not None:
@@ -130,21 +164,22 @@ class Int8LinearFn(torch.autograd.Function):
 
         # -- grad_in (backward input) -------------------------------------------
         #   grad_in = (grad_out · weight_scale) @ int_weight
-        #   Per-token quantise grad_out, int8 matmul, dequant only the result.
+        #   Per-token quantise grad_out, int8 cuBLASLt matmul, dequant the result.
         go_q, go_scale = _quantize_activation_per_token(
             grad_out_f32 * ws_f32.view(1, -1)
         )
-        grad_in_i32 = go_q.to(torch.int32).matmul(int_weight.to(torch.int32))
+        grad_in_i32 = _int8_gemm_backward_input(go_q, int_weight)
         grad_in = grad_in_i32.float() * go_scale
 
         # -- grad_w (int8 weight gradient) --------------------------------------
         #   bitsandbytes-style: per-OUTPUT-channel quantise grad_out,
-        #   per-INPUT-channel stats from x_q, outer-product dequant.
+        #   per-INPUT-channel stats from x_q, int8 cuBLASLt matmul,
+        #   outer-product dequant.
         go_pc_q, go_pc_scale = _quantize_per_column(
             grad_out_f32 * ws_f32.view(1, -1)
         )
         x_col_scale = _col_stats_from_row_quant(x_q)
-        grad_w_i32 = go_pc_q.t().to(torch.int32).matmul(x_q.to(torch.int32))
+        grad_w_i32 = _int8_gemm_backward_weight(go_pc_q, x_q)
         grad_w = grad_w_i32.float() * go_pc_scale.t() * x_col_scale.view(1, -1)
         cached = _BIT_GRAD_CACHE.get(ctx.handle)
         if cached is None:
