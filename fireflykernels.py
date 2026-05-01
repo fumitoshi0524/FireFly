@@ -90,8 +90,8 @@ def _quantize_per_column(x2d: torch.Tensor, eps: float = 1e-8):
 
 
 def _col_stats_from_row_quant(q_i8: torch.Tensor, eps: float = 1e-8):
-    """Estimate per-column max-abs from a row-wise quantised int8 tensor."""
-    return q_i8.float().abs().amax(dim=0).clamp_min(float(eps)) / 127.0  # [ncol]
+    """Per-column max-abs from a row-wise quantised int8 tensor (no fp32 copy)."""
+    return q_i8.abs().to(torch.int32).amax(dim=0).clamp_min(1).float() / 127.0
 
 
 def _int8_gemm_forward(
@@ -147,9 +147,9 @@ class Int8LinearFn(torch.autograd.Function):
         if bias is not None:
             out.add_(bias.float().view(1, -1))
 
-        # Save only integer tensors + float scales.
+        # Save only int8 tensors + float scales — no large int32 buffer.
         ctx.save_for_backward(
-            x_q, x_scale, int_weight, weight_scale, out_i32,
+            x_q, x_scale, int_weight, weight_scale,
         )
         ctx.handle = int(handle)
         ctx.input_dtype = x2d.dtype
@@ -158,13 +158,11 @@ class Int8LinearFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x_q, x_scale, int_weight, weight_scale, out_i32 = ctx.saved_tensors
+        x_q, x_scale, int_weight, weight_scale = ctx.saved_tensors
         grad_out_f32 = grad_out.contiguous().float()
         ws_f32 = weight_scale.float()
 
         # -- grad_in (backward input) -------------------------------------------
-        #   grad_in = (grad_out · weight_scale) @ int_weight
-        #   Per-token quantise grad_out, int8 cuBLASLt matmul, dequant the result.
         go_q, go_scale = _quantize_activation_per_token(
             grad_out_f32 * ws_f32.view(1, -1)
         )
@@ -172,9 +170,6 @@ class Int8LinearFn(torch.autograd.Function):
         grad_in = grad_in_i32.float() * go_scale
 
         # -- grad_w (int8 weight gradient) --------------------------------------
-        #   bitsandbytes-style: per-OUTPUT-channel quantise grad_out,
-        #   per-INPUT-channel stats from x_q, int8 cuBLASLt matmul,
-        #   outer-product dequant.
         go_pc_q, go_pc_scale = _quantize_per_column(
             grad_out_f32 * ws_f32.view(1, -1)
         )
@@ -187,9 +182,9 @@ class Int8LinearFn(torch.autograd.Function):
         else:
             cached.add_(grad_w.to(dtype=torch.bfloat16))
 
-        # -- grad_weight_scale (now a trainable Parameter) -----------------------
-        #   out = out_i32 · x_scale · weight_scale
-        #   ∂out/∂weight_scale = out_i32 · x_scale
+        # -- grad_weight_scale --------------------------------------------------
+        #   Re-run forward int8 matmul (not saved — saves ~12 GB GPU memory).
+        out_i32 = _int8_gemm_forward(x_q, int_weight)
         grad_weight_scale = (
             grad_out_f32 * out_i32.float() * x_scale
         ).sum(dim=0).to(dtype=weight_scale.dtype)
