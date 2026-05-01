@@ -74,7 +74,7 @@ class FireFlyOptim(Optimizer):
     def __init__(
         self,
         params,
-        lr_int8=0.01,
+        lr_int8=1e-5,
         lr_dense=1e-3,
         clip_grad=1.0,
         theta=0.0,
