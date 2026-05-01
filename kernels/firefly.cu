@@ -29,7 +29,7 @@ __global__ void int8_gemm_forward_kernel(
     const int col0  = blockIdx.x * TILE_N + threadIdx.y * 4;
 
     // Register accumulator — 4 values along the N dimension
-    int32_t acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+    unsigned int acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
 
     const int K_blocks = (K + TILE_K - 1) / TILE_K;
 
@@ -41,22 +41,22 @@ __global__ void int8_gemm_forward_kernel(
         for (int k = k0; k + 3 < k_limit; k += 4) {
 
             // Load 4 activation values as a packed uint32
-            uint32_t a_pack;
+            unsigned int a_pack;
             if (row < M) {
                 const int off = row * K + k;
-                a_pack = *reinterpret_cast<const uint32_t*>(A + off);
+                a_pack = *reinterpret_cast<const unsigned int*>(A + off);
             } else {
                 a_pack = 0;
             }
 
             // Load 4 weight values (B has N rows, we need 4 different rows)
-            uint32_t b_pack[4];
+            unsigned int b_pack[4];
             #pragma unroll
             for (int d = 0; d < 4; ++d) {
                 int b_row = col0 + d;
                 if (b_row < N && k < k_limit) {
                     const int off = b_row * K + k;
-                    b_pack[d] = *reinterpret_cast<const uint32_t*>(B + off);
+                    b_pack[d] = *reinterpret_cast<const unsigned int*>(B + off);
                 } else {
                     b_pack[d] = 0;
                 }
@@ -72,10 +72,10 @@ __global__ void int8_gemm_forward_kernel(
 
     // Write 4 output elements
     if (row < M) {
-        if (col0 + 0 < N) C[row * N + col0 + 0] = acc0;
-        if (col0 + 1 < N) C[row * N + col0 + 1] = acc1;
-        if (col0 + 2 < N) C[row * N + col0 + 2] = acc2;
-        if (col0 + 3 < N) C[row * N + col0 + 3] = acc3;
+        if (col0 + 0 < N) C[row * N + col0 + 0] = (int32_t)acc0;
+        if (col0 + 1 < N) C[row * N + col0 + 1] = (int32_t)acc1;
+        if (col0 + 2 < N) C[row * N + col0 + 2] = (int32_t)acc2;
+        if (col0 + 3 < N) C[row * N + col0 + 3] = (int32_t)acc3;
     }
 }
 
@@ -92,7 +92,7 @@ __global__ void int8_gemm_bw_input_kernel(
     const int row   = blockIdx.y * TILE_M + threadIdx.x;
     const int col0  = blockIdx.x * TILE_N + threadIdx.y * 4;
 
-    int32_t acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+    unsigned int acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
 
     const int O_blocks = (O + TILE_K - 1) / TILE_K;
 
@@ -103,20 +103,20 @@ __global__ void int8_gemm_bw_input_kernel(
         for (int o = o0; o + 3 < o_limit; o += 4) {
 
             // Load 4 values from A along the O dimension
-            uint32_t a_pack;
+            unsigned int a_pack;
             if (row < M) {
-                a_pack = *reinterpret_cast<const uint32_t*>(A + row * O + o);
+                a_pack = *reinterpret_cast<const unsigned int*>(A + row * O + o);
             } else {
                 a_pack = 0;
             }
 
             // Load 4 values from B for each of 4 output columns
-            uint32_t b_pack[4];
+            unsigned int b_pack[4];
             #pragma unroll
             for (int d = 0; d < 4; ++d) {
                 int k = col0 + d;
                 if (k < K) {
-                    b_pack[d] = *reinterpret_cast<const uint32_t*>(B + o * K + k);
+                    b_pack[d] = *reinterpret_cast<const unsigned int*>(B + o * K + k);
                 } else {
                     b_pack[d] = 0;
                 }
@@ -130,10 +130,10 @@ __global__ void int8_gemm_bw_input_kernel(
     }
 
     if (row < M) {
-        if (col0 + 0 < K) C[row * K + col0 + 0] = acc0;
-        if (col0 + 1 < K) C[row * K + col0 + 1] = acc1;
-        if (col0 + 2 < K) C[row * K + col0 + 2] = acc2;
-        if (col0 + 3 < K) C[row * K + col0 + 3] = acc3;
+        if (col0 + 0 < K) C[row * K + col0 + 0] = (int32_t)acc0;
+        if (col0 + 1 < K) C[row * K + col0 + 1] = (int32_t)acc1;
+        if (col0 + 2 < K) C[row * K + col0 + 2] = (int32_t)acc2;
+        if (col0 + 3 < K) C[row * K + col0 + 3] = (int32_t)acc3;
     }
 }
 
@@ -153,25 +153,25 @@ __global__ void int8_gemm_bw_weight_kernel(
     const int row   = blockIdx.y * TILE_M + threadIdx.x;   // O dimension
     const int col0  = blockIdx.x * TILE_N + threadIdx.y * 4; // K dimension
 
-    int32_t acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
+    unsigned int acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
 
     for (int m = 0; m + 3 < M; m += 4) {
 
         // Load 4 A values across the M dimension for this O row
-        uint32_t a_pack;
+        unsigned int a_pack;
         if (row < O) {
-            a_pack = *reinterpret_cast<const uint32_t*>(A + m * O + row);
+            a_pack = *reinterpret_cast<const unsigned int*>(A + m * O + row);
         } else {
             a_pack = 0;
         }
 
         // Load 4 B values across the M dimension for each K column
-        uint32_t b_pack[4];
+        unsigned int b_pack[4];
         #pragma unroll
         for (int d = 0; d < 4; ++d) {
             int k = col0 + d;
             if (k < K) {
-                b_pack[d] = *reinterpret_cast<const uint32_t*>(B + m * K + k);
+                b_pack[d] = *reinterpret_cast<const unsigned int*>(B + m * K + k);
             } else {
                 b_pack[d] = 0;
             }
@@ -184,10 +184,10 @@ __global__ void int8_gemm_bw_weight_kernel(
     }
 
     if (row < O) {
-        if (col0 + 0 < K) C[row * K + col0 + 0] = acc0;
-        if (col0 + 1 < K) C[row * K + col0 + 1] = acc1;
-        if (col0 + 2 < K) C[row * K + col0 + 2] = acc2;
-        if (col0 + 3 < K) C[row * K + col0 + 3] = acc3;
+        if (col0 + 0 < K) C[row * K + col0 + 0] = (int32_t)acc0;
+        if (col0 + 1 < K) C[row * K + col0 + 1] = (int32_t)acc1;
+        if (col0 + 2 < K) C[row * K + col0 + 2] = (int32_t)acc2;
+        if (col0 + 3 < K) C[row * K + col0 + 3] = (int32_t)acc3;
     }
 }
 
