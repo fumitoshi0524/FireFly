@@ -113,16 +113,19 @@ class Int8LinearFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         x2d, int_weight, weight_scale = ctx.saved_tensors
-        grad_out = grad_out.contiguous()
+
+        # Cast to bf16 for Tensor-Core matmul
+        go_bf16 = grad_out.contiguous().to(torch.bfloat16)
+        x2d_bf16 = x2d.to(torch.bfloat16)
 
         # Recompute bf16 weight (cheap: int8→bf16 convert + element-wise scale)
         w_bf16 = int_weight.to(torch.bfloat16) * weight_scale.to(torch.bfloat16).unsqueeze(1)
 
         # grad_in  = grad_out @ W          BF16 Tensor Cores
-        grad_in = torch.matmul(grad_out, w_bf16)
+        grad_in_bf16 = torch.matmul(go_bf16, w_bf16)
 
         # grad_w   = grad_out^T @ x2d      BF16 Tensor Cores
-        grad_w = torch.matmul(grad_out.t(), x2d)
+        grad_w = torch.matmul(go_bf16.t(), x2d_bf16)
         cached = _BIT_GRAD_CACHE.get(ctx.handle)
         if cached is None:
             _BIT_GRAD_CACHE[ctx.handle] = grad_w.to(dtype=torch.bfloat16)
@@ -136,10 +139,10 @@ class Int8LinearFn(torch.autograd.Function):
             grad_w.float() * int_weight.float()
         ).sum(dim=1).to(dtype=weight_scale.dtype)
 
-        grad_bias = grad_out.sum(dim=0).to(dtype=grad_out.dtype) if ctx.has_bias else None
+        grad_bias = go_bf16.sum(dim=0).to(dtype=grad_out.dtype) if ctx.has_bias else None
 
         return (
-            grad_in,            # x2d
+            grad_in_bf16.to(dtype=grad_out.dtype),  # x2d
             None,               # int_weight (buffer, gradient via cache)
             grad_weight_scale,  # weight_scale (trainable Parameter)
             grad_bias,          # bias
