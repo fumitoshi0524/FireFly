@@ -98,6 +98,11 @@ class Int8LinearFn(torch.autograd.Function):
         if ext is not None and hasattr(ext, "ff_int8_linear_forward"):
             out_i32 = ext.ff_int8_linear_forward(x_q.contiguous(), int_weight.contiguous())
         else:
+            if x_q.is_cuda:
+                raise RuntimeError(
+                    "INT8 CUDA kernel is required but not loaded. "
+                    "Build and load firefly_bitnet_ext (ff_int8_linear_forward)."
+                )
             out_i32 = x_q.to(torch.int32).matmul(int_weight.to(torch.int32).t())
         out = out_i32.float() * (x_scale * weight_scale.float().view(1, -1))
         out.mul_(channel_scale.float().view(1, -1))
@@ -164,6 +169,17 @@ def update_int8_weight_(int_weight: torch.Tensor, delta_q: torch.Tensor) -> None
     if delta_q.shape != int_weight.shape:
         raise ValueError(
             f"delta_q shape mismatch: expected {tuple(int_weight.shape)}, got {tuple(delta_q.shape)}"
+        )
+    ext = _get_firefly_ext()
+    if ext is not None and hasattr(ext, "ff_int8_weight_update_"):
+        ext.ff_int8_weight_update_(
+            int_weight.contiguous(), delta_q.to(torch.int32).contiguous()
+        )
+        return
+    if int_weight.is_cuda:
+        raise RuntimeError(
+            "INT8 CUDA optimizer kernel is required but not loaded. "
+            "Build and load firefly_bitnet_ext (ff_int8_weight_update_)."
         )
     next_weight = int_weight.to(torch.int16).add_(delta_q.to(torch.int16))
     next_weight.clamp_(-127, 127)

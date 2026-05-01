@@ -146,3 +146,34 @@ torch::Tensor ff_int8_linear_backward_weight_cuda(torch::Tensor grad_out, torch:
     C10_CUDA_CHECK(cudaGetLastError());
     return grad_w;
 }
+
+__global__ void ff_int8_weight_update_kernel(
+    int8_t* int_weight,
+    const int32_t* delta_q,
+    int64_t n)
+{
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    int32_t v = static_cast<int32_t>(int_weight[i]) + delta_q[i];
+    if (v > 127)
+        v = 127;
+    if (v < -127)
+        v = -127;
+    int_weight[i] = static_cast<int8_t>(v);
+}
+
+void ff_int8_weight_update_cuda(torch::Tensor int_weight, torch::Tensor delta_q)
+{
+    auto w_c = int_weight.contiguous();
+    auto d_c = delta_q.contiguous();
+    const int64_t n = w_c.numel();
+    const int threads = 256;
+    const int blocks = static_cast<int>((n + threads - 1) / threads);
+    ff_int8_weight_update_kernel<<<blocks, threads>>>(
+        w_c.data_ptr<int8_t>(),
+        d_c.data_ptr<int32_t>(),
+        n);
+    C10_CUDA_CHECK(cudaGetLastError());
+    int_weight.copy_(w_c);
+}

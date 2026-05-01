@@ -3,6 +3,7 @@
 torch::Tensor ff_int8_linear_forward_cuda(torch::Tensor x_q, torch::Tensor w_q);
 torch::Tensor ff_int8_linear_backward_input_cuda(torch::Tensor grad_out, torch::Tensor w_q, torch::Tensor w_scale, torch::Tensor c_scale);
 torch::Tensor ff_int8_linear_backward_weight_cuda(torch::Tensor grad_out, torch::Tensor x);
+void ff_int8_weight_update_cuda(torch::Tensor int_weight, torch::Tensor delta_q);
 
 #if !FIREFLY_USE_CUDA
 torch::Tensor ff_int8_linear_forward_cuda(torch::Tensor, torch::Tensor)
@@ -14,6 +15,10 @@ torch::Tensor ff_int8_linear_backward_input_cuda(torch::Tensor, torch::Tensor, t
     TORCH_CHECK(false, "firefly_bitnet_ext was built without CUDA support");
 }
 torch::Tensor ff_int8_linear_backward_weight_cuda(torch::Tensor, torch::Tensor)
+{
+    TORCH_CHECK(false, "firefly_bitnet_ext was built without CUDA support");
+}
+void ff_int8_weight_update_cuda(torch::Tensor, torch::Tensor)
 {
     TORCH_CHECK(false, "firefly_bitnet_ext was built without CUDA support");
 }
@@ -94,6 +99,27 @@ torch::Tensor ff_int8_linear_backward_weight_cpu(torch::Tensor grad_out, torch::
     return torch::matmul(go_c.transpose(0, 1), x_c);
 }
 
+void ff_int8_weight_update_cpu(torch::Tensor int_weight, torch::Tensor delta_q)
+{
+    auto w_c = int_weight.contiguous();
+    auto d_c = delta_q.contiguous();
+    TORCH_CHECK(w_c.scalar_type() == torch::kInt8, "int_weight must be int8");
+    TORCH_CHECK(d_c.scalar_type() == torch::kInt32, "delta_q must be int32");
+    TORCH_CHECK(w_c.sizes() == d_c.sizes(), "shape mismatch in ff_int8_weight_update_");
+
+    int8_t* w_ptr = w_c.data_ptr<int8_t>();
+    const int32_t* d_ptr = d_c.data_ptr<int32_t>();
+    const int64_t n = w_c.numel();
+    for (int64_t i = 0; i < n; ++i)
+    {
+        int32_t v = static_cast<int32_t>(w_ptr[i]) + d_ptr[i];
+        if (v > 127) v = 127;
+        if (v < -127) v = -127;
+        w_ptr[i] = static_cast<int8_t>(v);
+    }
+    int_weight.copy_(w_c);
+}
+
 torch::Tensor ff_int8_linear_forward(torch::Tensor x_q, torch::Tensor w_q)
 {
     if (x_q.is_cuda())
@@ -119,9 +145,20 @@ torch::Tensor ff_int8_linear_backward_weight(torch::Tensor grad_out, torch::Tens
     return ff_int8_linear_backward_weight_cpu(grad_out, x);
 }
 
+void ff_int8_weight_update_(torch::Tensor int_weight, torch::Tensor delta_q)
+{
+    if (int_weight.is_cuda())
+    {
+        ff_int8_weight_update_cuda(int_weight, delta_q);
+        return;
+    }
+    ff_int8_weight_update_cpu(int_weight, delta_q);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("ff_int8_linear_forward", &ff_int8_linear_forward, "int8 linear forward (int8xint8->int32)");
     m.def("ff_int8_linear_backward_input", &ff_int8_linear_backward_input, "int8 linear backward input");
     m.def("ff_int8_linear_backward_weight", &ff_int8_linear_backward_weight, "int8 linear backward weight");
+    m.def("ff_int8_weight_update_", &ff_int8_weight_update_, "int8 in-place weight update");
 }
