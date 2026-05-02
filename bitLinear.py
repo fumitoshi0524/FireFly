@@ -7,36 +7,34 @@ from .fireflykernels import (
     Int8LinearFn,
     consume_bit_grad,
     next_bit_handle,
-    quantize_fp_to_int8,
     register_bit_handle,
     release_bit_handle,
 )
 
 
 def _init_int8_weight(out_features: int, in_features: int):
-    """Kaiming-uniform init, quantise to int8, return (int_weight, scale) buffers.
+    """Kaiming-uniform init, quantise to int8.
 
-    The scale is per-row ``max_abs * sqrt(in_features) / 127`` so that
-    ``int_weight * scale / sqrt(in_features)`` reproduces the kaiming weight.
-    This keeps ``weight_scale`` near ~0.03 regardless of fan-in.
+    Matches bnb ``int8_vectorwise_quant``: per-row max_abs / 127 scale.
+    W_int8 = clip(round(W / scale), -128, 127)  with  scale = max_abs_per_row / 127.
+    W_eff  = int_weight * weight_scale  ≈  original kaiming weight.
     """
     weight = torch.empty((out_features, in_features), dtype=torch.float32)
     nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
-    q, scale = quantize_fp_to_int8(weight)
-    scale = scale * math.sqrt(in_features)
-    return q, scale
+    w = weight.float()
+    scale_per_row = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 127.0
+    q = torch.round(w / scale_per_row).clamp(-127, 127).to(torch.int8)
+    return q.contiguous(), scale_per_row.squeeze(1).contiguous()
 
 
 class BitLinear(nn.Module):
-    """INT8 linear layer matching bnb Int8Params + DQT design.
+    """INT8 linear layer matching bnb ``Int8Params`` + DQT paper.
 
-    * ``int_weight`` — int8 buffer ``[O, K]``, the quantised weight.
-    * ``weight_scale`` — float buffer ``[O]``, per-row ``max_abs / 127``, fixed at init.
-    * ``scale`` — ``1/sqrt(in_features)``, normalises output variance (kaiming).
-
-    Gradients for ``int_weight`` are stashed in ``_BIT_GRAD_CACHE`` and consumed
-    by :class:`FireFlyOptim` for DQT stochastic rounding.  ``weight_scale`` is
-    **not trainable** — neither bnb nor the DQT paper back-propagate through it.
+    * ``int_weight``    — int8 buffer ``[O, K]``, the quantised weight (bnb's CB).
+    * ``weight_scale``  — float buffer ``[O]``, per-row max_abs/127 (bnb's SCB/127).
+    * Forward: ``W_eff = int_weight * weight_scale``, then standard matmul.
+    * Gradients for ``int_weight`` are stashed in ``_BIT_GRAD_CACHE`` and consumed
+      by :class:`FireFlyOptim` for DQT stochastic rounding.
     """
 
     def __init__(
@@ -48,7 +46,6 @@ class BitLinear(nn.Module):
         super().__init__()
         self.in_features = int(in_features)
         self.out_features = int(out_features)
-        self.scale = 1.0 / math.sqrt(in_features)
 
         int_init, scale_init = _init_int8_weight(
             out_features=self.out_features, in_features=self.in_features
@@ -94,7 +91,6 @@ class BitLinear(nn.Module):
             self.bias,
             int(self._bit_handle.item()),
         )
-        out2d = out2d * self.scale
         return out2d.view(*x.shape[:-1], self.out_features)
 
     def consume_weight_grad(self) -> torch.Tensor | None:
