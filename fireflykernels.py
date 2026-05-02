@@ -80,7 +80,7 @@ def _cached_weight_transform(
 
     # bitsandbytes expects fp16 input for int8_vectorwise_quant
     w_fp16 = int_weight.to(torch.float16) * weight_scale.to(torch.float16).unsqueeze(1)
-    w_q, _w_s = _BNB_F.int8_vectorwise_quant(w_fp16)
+    w_q, _w_s, _ = _BNB_F.int8_vectorwise_quant(w_fp16)
     CxB, SB = _BNB_F.transform(w_q, _BNB_FMT)
     _BNB_WCACHE[handle] = (CxB, SB, cur_ver)
     return CxB, SB
@@ -119,15 +119,11 @@ class Int8LinearFn(torch.autograd.Function):
         bias: torch.Tensor | None,  # [O]     float
         handle: int,
     ):
-        if _BNB_F is not None:
-            return _forward_bnb(ctx, x2d, int_weight, weight_scale, bias, handle)
         return _forward_bf16(ctx, x2d, int_weight, weight_scale, bias, handle)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        if _BNB_F is not None:
-            return _backward_bnb(ctx, grad_out)
-        return _backward_bf16(ctx, grad_out)
+        return _backward_impl(ctx, grad_out)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +133,7 @@ class Int8LinearFn(torch.autograd.Function):
 def _forward_bnb(ctx, x2d, int_weight, weight_scale, bias, handle):
     # 1. Quantise activation — bitsandbytes works in fp16
     x_fp16 = x2d.half()
-    CA, SCA = _BNB_F.int8_vectorwise_quant(x_fp16)
+    CA, SCA, _ = _BNB_F.int8_vectorwise_quant(x_fp16)
 
     # 2. Transform activation to col32 layout
     C32A, SA = _BNB_F.transform(CA, "col32")
@@ -154,58 +150,11 @@ def _forward_bnb(ctx, x2d, int_weight, weight_scale, bias, handle):
     if bias is not None:
         out.add_(bias.half())
 
-    # Save quantised activation for backward
-    ctx.save_for_backward(CA, SCA, int_weight, weight_scale)
+    ctx.save_for_backward(x2d.to(torch.bfloat16), int_weight, weight_scale)
     ctx.handle = int(handle)
     ctx.has_bias = bias is not None
     ctx.input_dtype = x2d.dtype
     return out.to(dtype=x2d.dtype)
-
-
-def _backward_bnb(ctx, grad_out):
-    CA, SCA, int_weight, weight_scale = ctx.saved_tensors
-    go_fp16 = grad_out.half()
-    ws_fp16 = weight_scale.half()
-    handle = ctx.handle
-
-    CxB, SB = _cached_weight_transform(handle, int_weight, weight_scale)
-
-    # --- grad_in = grad_out @ W  (use igemmlt with same weight layout) ---
-    Cgo, SCgo = _BNB_F.int8_vectorwise_quant(go_fp16)
-    C32go, Sgo = _BNB_F.transform(Cgo, "col32")
-    grad_in_i32, _ = _BNB_F.igemmlt(C32go, CxB, Sgo, SB)
-    grad_in = _BNB_F.mm_dequant(grad_in_i32, SCgo, ws_fp16.unsqueeze(0))
-
-    # --- grad_w = grad_out^T @ x  (swap operands: x_q as A, go as B) ---
-    # Save x_q (int8) from forward → transform, then igemmlt(go_col32, xq_col32, transposed_B=True)
-    C32x, Sx = _BNB_F.transform(CA, "col32")  # CA is the saved int8 activation
-
-    Cg2, SCg2 = _BNB_F.int8_vectorwise_quant(go_fp16)
-    C32g2, Sg2 = _BNB_F.transform(Cg2, "col32")
-
-    grad_w_i32, _ = _BNB_F.igemmlt(C32g2, C32x, Sg2, Sx)
-    grad_w = _BNB_F.mm_dequant(grad_w_i32, SCg2, SCA)
-
-    cached = _BIT_GRAD_CACHE.get(handle)
-    if cached is None:
-        _BIT_GRAD_CACHE[handle] = grad_w.to(dtype=torch.bfloat16)
-    else:
-        cached.add_(grad_w.to(dtype=torch.bfloat16))
-
-    # --- grad_weight_scale  =  (grad_w ⊙ int_weight).sum(dim=1) ---
-    grad_weight_scale = (
-        grad_w.float() * int_weight.float()
-    ).sum(dim=1).to(dtype=weight_scale.dtype)
-
-    grad_bias = go_fp16.sum(dim=0).to(dtype=grad_out.dtype) if ctx.has_bias else None
-
-    return (
-        grad_in.to(dtype=grad_out.dtype),
-        None,
-        grad_weight_scale,
-        grad_bias,
-        None,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +174,11 @@ def _forward_bf16(ctx, x2d, int_weight, weight_scale, bias, handle):
     return out
 
 
-def _backward_bf16(ctx, grad_out):
+# ---------------------------------------------------------------------------
+# Common backward (BF16 matmul — correct for both forward paths)
+# ---------------------------------------------------------------------------
+
+def _backward_impl(ctx, grad_out):
     x2d_bf16, int_weight, weight_scale = ctx.saved_tensors
     go_bf16 = grad_out.to(torch.bfloat16)
     ws_bf16 = weight_scale.to(torch.bfloat16)

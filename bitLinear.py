@@ -16,7 +16,9 @@ from .fireflykernels import (
 def _init_int8_weight(out_features: int, in_features: int):
     weight = torch.empty((out_features, in_features), dtype=torch.float32)
     nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
-    return quantize_fp_to_int8(weight)
+    q, scale = quantize_fp_to_int8(weight)
+    scale = scale * math.sqrt(in_features)
+    return q, scale
 
 
 class BitLinear(nn.Module):
@@ -83,6 +85,7 @@ class BitLinear(nn.Module):
             self.bias,
             int(self._bit_handle.item()),
         )
+        out2d = out2d * self.scale
         return out2d.view(*x.shape[:-1], self.out_features)
 
     def consume_weight_grad(self) -> torch.Tensor | None:

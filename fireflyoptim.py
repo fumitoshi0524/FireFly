@@ -81,6 +81,7 @@ class FireFlyOptim(Optimizer):
         bit_modules=None,
         min_8bit_size=4096,
         block_size=256,
+        weight_decay=0.0,
     ):
         defaults = dict(
             lr_int8=float(lr_int8),
@@ -89,6 +90,7 @@ class FireFlyOptim(Optimizer):
             theta=float(theta),
             min_8bit_size=int(min_8bit_size),
             block_size=int(block_size),
+            weight_decay=float(weight_decay),
         )
         super().__init__(params, defaults)
         self.bit_modules = list(bit_modules) if bit_modules is not None else []
@@ -176,6 +178,15 @@ class FireFlyOptim(Optimizer):
                     v_q, v_absmax = _quantize_blockwise_unsigned(v, block_size)
                     state["m_q"], state["m_absmax"] = m_q, m_absmax
                     state["v_q"], state["v_absmax"] = v_q, v_absmax
+
+        # --- weight_scale regularization ---
+        weight_decay = float(self.defaults["weight_decay"])
+        if weight_decay > 0:
+            lr_dense_for_decay = float(self.defaults["lr_dense"])
+            ws_decay = lr_dense_for_decay * weight_decay
+            for module in self.bit_modules:
+                module.weight_scale.mul_(1 - ws_decay)
+                module.weight_scale.clamp_(min=0)
 
         if self.bit_modules:
             cfg = self.param_groups[0]
