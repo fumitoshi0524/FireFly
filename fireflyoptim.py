@@ -6,12 +6,7 @@ from .fireflykernels import update_int8_weight_, _invalidate_weight_cache
 
 
 class FireFlyOptim(AdamW8bit):
-    """bnb AdamW8bit + DQT stochastic rounding for INT8 weights.
-
-    Dense parameters (RMSNorm, lm_head, biases) use standard bnb 8-bit AdamW.
-    INT8 weights use the SAME lr / betas / weight_decay, then stochastic rounding
-    snaps them back to int8 (matching the DQT paper).
-    """
+    """bnb AdamW8bit + DQT stochastic rounding for INT8 weights."""
 
     def __init__(
         self,
@@ -19,13 +14,7 @@ class FireFlyOptim(AdamW8bit):
         lr=1e-3,
         betas=(0.9, 0.95),
         eps=1e-8,
-        weight_decay=1e-1,
-        amsgrad=False,
-        optim_bits=8,
-        min_8bit_size=4096,
-        percentile_clipping=100,
-        block_wise=True,
-        is_paged=False,
+        weight_decay=0.1,
         theta=0.0,
         bit_modules=None,
     ):
@@ -35,13 +24,6 @@ class FireFlyOptim(AdamW8bit):
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
-            amsgrad=amsgrad,
-            optim_bits=optim_bits,
-            args=None,
-            min_8bit_size=min_8bit_size,
-            percentile_clipping=percentile_clipping,
-            block_wise=block_wise,
-            is_paged=is_paged,
         )
         self.bit_modules = list(bit_modules) if bit_modules is not None else []
         self._bit_handles = (
@@ -62,14 +44,11 @@ class FireFlyOptim(AdamW8bit):
 
     @torch.no_grad()
     def step(self, closure=None):
-        # 1. Standard AdamW for dense params (RMSNorm, lm_head, biases)
         loss = super().step(closure)
 
         if not self.bit_modules:
             return loss
 
-        # 2. DQT stochastic rounding for INT8 weights
-        # Uses the SAME lr, betas, weight_decay as the dense AdamW
         group = self.param_groups[0]
         lr = float(group["lr"])
         beta1, beta2 = group["betas"]
@@ -83,32 +62,27 @@ class FireFlyOptim(AdamW8bit):
             g = g.float().contiguous()
 
             state = self._bit_state.setdefault(handle, {})
-            if "m" not in state or state["m"].shape != g.shape:
+            if "step" not in state:
+                state["step"] = 0
                 state["m"] = torch.zeros_like(g, dtype=torch.float32)
                 state["v"] = torch.zeros_like(g, dtype=torch.float32)
-                state["t"] = 0
-            if "residual" not in state or state["residual"].shape != g.shape:
                 state["residual"] = torch.zeros_like(g, dtype=torch.float32)
 
             m, v, residual = state["m"], state["v"], state["residual"]
+            state["step"] += 1
+            t = state["step"]
 
-            state["t"] += 1
-            # AdamW update: m = b1*m + (1-b1)*g, v = b2*v + (1-b2)*g^2
             m.mul_(beta1).add_(g, alpha=1.0 - beta1)
             v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
-            m_hat = m / (1.0 - beta1 ** state["t"])
-            v_hat = v / (1.0 - beta2 ** state["t"])
+            m_hat = m / (1.0 - beta1 ** t)
+            v_hat = v / (1.0 - beta2 ** t)
 
-            # Dense AdamW step: ΔW_eff = -lr * (m_hat / (sqrt(v_hat) + eps) + wd * W_eff)
-            # Convert to INT8 units: residual += ΔW_eff / weight_scale
             ws = module.weight_scale.float().unsqueeze(1).clamp_min(eps)
             iw = module.int_weight.float()
-            w_eff = iw * ws  # current effective weight
             adam_term = m_hat / (v_hat.sqrt() + eps)
-            delta_w_eff = -lr * (adam_term + wd * w_eff)
+            delta_w_eff = -lr * (adam_term + wd * iw * ws)
             residual.add_(delta_w_eff / ws)
 
-            # Stochastic rounding: when |residual| >= 1, flip int_weight
             abs_res = residual.abs()
             base = torch.floor(abs_res)
             frac = abs_res - base
