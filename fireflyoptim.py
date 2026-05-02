@@ -100,7 +100,7 @@ class FireFlyOptim(AdamW8bit):
         state = super().state_dict()
         state["bit_state"] = {
             int(handle): {
-                key: value.clone() if torch.is_tensor(value) else value
+                key: value.detach().cpu() if torch.is_tensor(value) else value
                 for key, value in per_handle.items()
             }
             for handle, per_handle in self._bit_state.items()
