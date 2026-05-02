@@ -194,18 +194,16 @@ def _backward_impl(ctx, grad_out):
     else:
         cached.add_(grad_w.to(dtype=torch.bfloat16))
 
-    grad_weight_scale = (
-        grad_w.float() * int_weight.float()
-    ).sum(dim=1).to(dtype=weight_scale.dtype)
-
     grad_bias = go_bf16.sum(dim=0).to(dtype=grad_out.dtype) if ctx.has_bias else None
 
+    # int_weight and weight_scale are fixed buffers — no gradient flows to them.
+    # int_weight is updated via DQT in FireFlyOptim; weight_scale stays fixed.
     return (
         grad_in.to(dtype=grad_out.dtype),
-        None,
-        grad_weight_scale,
+        None,   # int_weight
+        None,   # weight_scale
         grad_bias,
-        None,
+        None,   # handle
     )
 
 

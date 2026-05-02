@@ -14,6 +14,12 @@ from .fireflykernels import (
 
 
 def _init_int8_weight(out_features: int, in_features: int):
+    """Kaiming-uniform init, quantise to int8, return (int_weight, scale) buffers.
+
+    The scale is per-row ``max_abs * sqrt(in_features) / 127`` so that
+    ``int_weight * scale / sqrt(in_features)`` reproduces the kaiming weight.
+    This keeps ``weight_scale`` near ~0.03 regardless of fan-in.
+    """
     weight = torch.empty((out_features, in_features), dtype=torch.float32)
     nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
     q, scale = quantize_fp_to_int8(weight)
@@ -22,30 +28,33 @@ def _init_int8_weight(out_features: int, in_features: int):
 
 
 class BitLinear(nn.Module):
+    """INT8 linear layer matching bnb Int8Params + DQT design.
+
+    * ``int_weight`` — int8 buffer ``[O, K]``, the quantised weight.
+    * ``weight_scale`` — float buffer ``[O]``, per-row ``max_abs / 127``, fixed at init.
+    * ``scale`` — ``1/sqrt(in_features)``, normalises output variance (kaiming).
+
+    Gradients for ``int_weight`` are stashed in ``_BIT_GRAD_CACHE`` and consumed
+    by :class:`FireFlyOptim` for DQT stochastic rounding.  ``weight_scale`` is
+    **not trainable** — neither bnb nor the DQT paper back-propagate through it.
+    """
+
     def __init__(
         self,
         in_features: int,
         out_features: int,
         bias: bool = False,
-        threshold: float = 0.0,
-        n0prob: float = 0.3,
     ) -> None:
         super().__init__()
         self.in_features = int(in_features)
         self.out_features = int(out_features)
-        self.threshold = float(threshold)
         self.scale = 1.0 / math.sqrt(in_features)
-        self.n0prob = float(n0prob)
 
         int_init, scale_init = _init_int8_weight(
             out_features=self.out_features, in_features=self.in_features
         )
-        self.register_buffer(
-            "int_weight",
-            int_init,
-            persistent=True,
-        )
-        self.weight_scale = nn.Parameter(scale_init)
+        self.register_buffer("int_weight", int_init, persistent=True)
+        self.register_buffer("weight_scale", scale_init, persistent=True)
         self.register_buffer(
             "_bit_handle",
             torch.tensor(next_bit_handle(), dtype=torch.int64),

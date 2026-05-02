@@ -71,17 +71,25 @@ def _dequantize_blockwise_unsigned(
 
 
 class FireFlyOptim(Optimizer):
+    """Optimiser for FireFly INT8 models (matching bnb + DQT design).
+
+    * Dense params (RMSNorm, lm_head, biases) → Adam with gradient clipping.
+    * INT8 weights (``BitLinear.int_weight``) → DQT stochastic rounding.
+      Gradients are read from ``_BIT_GRAD_CACHE`` (stashed by ``Int8LinearFn``).
+    * ``weight_scale`` buffers are NOT trainable — they stay fixed at init
+      (matching bnb ``Int8Params.SCB``).
+    """
+
     def __init__(
         self,
         params,
-        lr_int8=1e-5,
+        lr_int8=1e-2,
         lr_dense=1e-3,
         clip_grad=1.0,
         theta=0.0,
         bit_modules=None,
         min_8bit_size=4096,
         block_size=256,
-        weight_decay=0.0,
     ):
         defaults = dict(
             lr_int8=float(lr_int8),
@@ -90,7 +98,6 @@ class FireFlyOptim(Optimizer):
             theta=float(theta),
             min_8bit_size=int(min_8bit_size),
             block_size=int(block_size),
-            weight_decay=float(weight_decay),
         )
         super().__init__(params, defaults)
         self.bit_modules = list(bit_modules) if bit_modules is not None else []
@@ -179,21 +186,12 @@ class FireFlyOptim(Optimizer):
                     state["m_q"], state["m_absmax"] = m_q, m_absmax
                     state["v_q"], state["v_absmax"] = v_q, v_absmax
 
-        # --- weight_scale regularization ---
-        weight_decay = float(self.defaults["weight_decay"])
-        if weight_decay > 0:
-            lr_dense_for_decay = float(self.defaults["lr_dense"])
-            ws_decay = lr_dense_for_decay * weight_decay
-            for module in self.bit_modules:
-                module.weight_scale.mul_(1 - ws_decay)
-                module.weight_scale.clamp_(min=0)
-
+        # ---- DQT stochastic rounding for INT8 weights ----
         if self.bit_modules:
             cfg = self.param_groups[0]
             lr_int8 = float(cfg["lr_int8"])
             min_8bit_size = int(cfg["min_8bit_size"])
             block_size = int(cfg["block_size"])
-
             theta = float(cfg.get("theta", 0.0))
 
             for module, handle in zip(self.bit_modules, self._bit_handles):
@@ -231,6 +229,7 @@ class FireFlyOptim(Optimizer):
                 v_hat = v / (1 - beta2 ** state["t"])
 
                 adam_step = -lr_int8 * (m_hat / (v_hat.sqrt() + eps))
+                # Convert W_eff gradient to int_weight gradient: ∂L/∂W_int = ∂L/∂W_eff * scale
                 denom = module.weight_scale.float().unsqueeze(1).clamp_min(eps)
                 # OU mean reversion: residual pulled toward zero at rate theta
                 residual.mul_(1.0 - theta).add_(adam_step / denom)
