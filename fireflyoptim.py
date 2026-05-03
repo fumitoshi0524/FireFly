@@ -5,7 +5,13 @@ from .bitLinear import BitLinear
 from .fireflykernels import update_int8_weight_, _invalidate_weight_cache
 
 
-# ---- 8-bit blockwise helpers (same scheme as bnb) ----
+# ---- 8-bit blockwise helpers with mu-law companding ----
+# Mu-law puts more quantisation levels near zero (where most values lie)
+# and fewer at extremes, matching the natural distribution of gradients.
+
+_MU = 255.0
+_1_OVER_LN1P_MU = 1.0 / 5.545177444479562  # 1 / ln(1 + 255)
+
 
 def _pad_to_block_multiple(t: torch.Tensor, blocksize: int, num_blocks: int):
     padded_size = num_blocks * blocksize
@@ -23,11 +29,12 @@ def _quantize_blockwise_signed(x: torch.Tensor, blocksize: int):
     x_padded = _pad_to_block_multiple(x_flat, blocksize, num_blocks)
     x_blocks = x_padded.view(num_blocks, blocksize)
     absmax = x_blocks.abs().amax(dim=1).clamp_min(1e-12)
-    q_blocks = (
-        torch.round(x_blocks / absmax.unsqueeze(1) * 127.0)
-        .clamp(-127, 127)
-        .to(torch.int16)
-    )
+
+    # mu-law companding: normalise → compress → quantise
+    x_norm = (x_blocks / absmax.unsqueeze(1)).clamp(-1.0, 1.0)
+    x_comp = torch.sign(x_norm) * torch.log1p(_MU * x_norm.abs()) * _1_OVER_LN1P_MU
+
+    q_blocks = torch.round(x_comp * 127.0).clamp(-127, 127).to(torch.int16)
     q_flat = (q_blocks.view(-1)[:numel] + 128).to(torch.uint8)
     return q_flat.view_as(x), absmax
 
@@ -38,7 +45,11 @@ def _dequantize_blockwise_signed(q, absmax, blocksize, shape):
     num_blocks = absmax.numel()
     q_padded = _pad_to_block_multiple(q_flat, blocksize, num_blocks)
     q_blocks = q_padded.view(num_blocks, blocksize).float()
-    out_blocks = ((q_blocks - 128.0) / 127.0) * absmax.unsqueeze(1)
+
+    # inverse mu-law
+    y = ((q_blocks - 128.0) / 127.0).clamp(-1.0, 1.0)
+    x_norm = torch.sign(y) * (torch.exp(y.abs() / _1_OVER_LN1P_MU) - 1.0) / _MU
+    out_blocks = x_norm * absmax.unsqueeze(1)
     return out_blocks.view(-1)[:numel].view(shape)
 
 
@@ -49,7 +60,12 @@ def _quantize_blockwise_unsigned(x: torch.Tensor, blocksize: int):
     x_padded = _pad_to_block_multiple(x_flat, blocksize, num_blocks)
     x_blocks = x_padded.view(num_blocks, blocksize)
     absmax = x_blocks.amax(dim=1).clamp_min(1e-12)
-    q_blocks = torch.round(x_blocks / absmax.unsqueeze(1) * 255.0).clamp(0, 255)
+
+    # mu-law companding (unsigned: [0, 1] range)
+    x_norm = (x_blocks / absmax.unsqueeze(1)).clamp(0.0, 1.0)
+    x_comp = torch.log1p(_MU * x_norm) * _1_OVER_LN1P_MU
+
+    q_blocks = torch.round(x_comp * 255.0).clamp(0, 255)
     q_flat = q_blocks.view(-1)[:numel].to(torch.uint8)
     return q_flat.view_as(x), absmax
 
@@ -60,7 +76,10 @@ def _dequantize_blockwise_unsigned(q, absmax, blocksize, shape):
     num_blocks = absmax.numel()
     q_padded = _pad_to_block_multiple(q_flat, blocksize, num_blocks)
     q_blocks = q_padded.view(num_blocks, blocksize).float()
-    out_blocks = (q_blocks / 255.0) * absmax.unsqueeze(1)
+
+    y = (q_blocks / 255.0).clamp(0.0, 1.0)
+    x_norm = (torch.exp(y / _1_OVER_LN1P_MU) - 1.0) / _MU
+    out_blocks = x_norm * absmax.unsqueeze(1)
     return out_blocks.view(-1)[:numel].view(shape)
 
 
@@ -137,12 +156,16 @@ class FireFlyOptim(AdamW8bit):
                 state["m_absmax"] = m_absmax
                 state["v_q"] = v_q
                 state["v_absmax"] = v_absmax
-                # residual in int8: range [-1, 1], scale 1/127
-                state["r_q"] = torch.zeros_like(g, dtype=torch.int8)
+                # residual also 8-bit blockwise, same scheme as m
+                r_q, r_absmax = _quantize_blockwise_signed(
+                    torch.zeros_like(g, dtype=torch.float32), bs
+                )
+                state["r_q"] = r_q
+                state["r_absmax"] = r_absmax
 
             m = _dequantize_blockwise_signed(state["m_q"], state["m_absmax"], bs, g.shape)
             v = _dequantize_blockwise_unsigned(state["v_q"], state["v_absmax"], bs, g.shape)
-            residual = state["r_q"].float() / 127.0
+            residual = _dequantize_blockwise_signed(state["r_q"], state["r_absmax"], bs, g.shape)
             state["step"] += 1
             t = state["step"]
 
@@ -160,7 +183,12 @@ class FireFlyOptim(AdamW8bit):
             abs_res = residual.abs()
             base = torch.floor(abs_res)
             frac = abs_res - base
-            extra = (torch.rand_like(frac) < frac).float()
+            # Momentum-biased SR: if adam_term agrees with residual direction,
+            # boost flip probability so weights "stuck" by rounding get unstuck.
+            # tanh(adam_term) ∈ [-1, 1], scaled by 0.15 → max ±15% bias.
+            bias = torch.tanh(adam_term) * 0.15 * torch.sign(residual)
+            frac_biased = (frac + bias).clamp(0.0, 1.0)
+            extra = (torch.rand_like(frac) < frac_biased).float()
             delta_q = (torch.sign(residual) * (base + extra)).to(torch.int32)
 
             if torch.any(delta_q != 0):
@@ -168,8 +196,9 @@ class FireFlyOptim(AdamW8bit):
                 residual = residual - delta_q.float()
                 _invalidate_weight_cache(handle)
 
-            # Store residual back as int8 (clamp to [-1, 1] range)
-            state["r_q"] = (residual.clamp(-1.0, 1.0) * 127.0).round().to(torch.int8)
+            r_q, r_absmax = _quantize_blockwise_signed(residual, bs)
+            state["r_q"] = r_q
+            state["r_absmax"] = r_absmax
 
             m_q, m_absmax = _quantize_blockwise_signed(m, bs)
             v_q, v_absmax = _quantize_blockwise_unsigned(v, bs)
