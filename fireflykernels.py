@@ -51,6 +51,7 @@ _BNB_FMT = "col_ampere"
 try:
     import bitsandbytes as _BNB
     import bitsandbytes.functional as _BNB_F
+
     if torch.cuda.is_available():
         cc = torch.cuda.get_device_capability()
         if cc[0] >= 8:
@@ -109,13 +110,12 @@ def quantize_fp_to_int8(weight: torch.Tensor, eps: float = 1e-8):
 # Int8LinearFn
 # ---------------------------------------------------------------------------
 class Int8LinearFn(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
-        x2d: torch.Tensor,          # [N, K]  (autocast doesn't cover custom Fns)
-        int_weight: torch.Tensor,   # [O, K]  int8
-        weight_scale: torch.Tensor, # [O]     float  (trainable Parameter)
+        x2d: torch.Tensor,  # [N, K]  (autocast doesn't cover custom Fns)
+        int_weight: torch.Tensor,  # [O, K]  int8
+        weight_scale: torch.Tensor,  # [O]     float  (trainable Parameter)
         bias: torch.Tensor | None,  # [O]     float
         handle: int,
     ):
@@ -129,6 +129,7 @@ class Int8LinearFn(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 # Path A: bitsandbytes cuBLASLt INT8 Tensor Cores
 # ---------------------------------------------------------------------------
+
 
 def _forward_bnb(ctx, x2d, int_weight, weight_scale, bias, handle):
     # 1. Quantise activation — bitsandbytes works in fp16
@@ -161,9 +162,12 @@ def _forward_bnb(ctx, x2d, int_weight, weight_scale, bias, handle):
 # Path B: BF16 fallback  (torch.matmul on BF16 Tensor Cores, works everywhere)
 # ---------------------------------------------------------------------------
 
+
 def _forward_bf16(ctx, x2d, int_weight, weight_scale, bias, handle):
     x2d_bf16 = x2d.to(torch.bfloat16)
-    w_bf16 = int_weight.to(torch.bfloat16) * weight_scale.to(torch.bfloat16).unsqueeze(1)
+    w_bf16 = int_weight.to(torch.bfloat16) * weight_scale.to(torch.bfloat16).unsqueeze(
+        1
+    )
     out = torch.matmul(x2d_bf16, w_bf16.t())
     if bias is not None:
         out.add_(bias)
@@ -177,6 +181,7 @@ def _forward_bf16(ctx, x2d, int_weight, weight_scale, bias, handle):
 # ---------------------------------------------------------------------------
 # Common backward (BF16 matmul — correct for both forward paths)
 # ---------------------------------------------------------------------------
+
 
 def _backward_impl(ctx, grad_out):
     x2d_bf16, int_weight, weight_scale = ctx.saved_tensors
@@ -200,16 +205,17 @@ def _backward_impl(ctx, grad_out):
     # int_weight is updated via DQT in FireFlyOptim; weight_scale stays fixed.
     return (
         grad_in.to(dtype=grad_out.dtype),
-        None,   # int_weight
-        None,   # weight_scale
+        None,  # int_weight
+        None,  # weight_scale
         grad_bias,
-        None,   # handle
+        None,  # handle
     )
 
 
 # ---------------------------------------------------------------------------
 # INT8 weight update
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def update_int8_weight_(int_weight: torch.Tensor, delta_q: torch.Tensor) -> None:

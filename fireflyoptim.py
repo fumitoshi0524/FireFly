@@ -6,9 +6,6 @@ from .fireflykernels import update_int8_weight_, _invalidate_weight_cache
 
 
 # ---- 8-bit blockwise helpers with mu-law companding ----
-# Mu-law puts more quantisation levels near zero (where most values lie)
-# and fewer at extremes, matching the natural distribution of gradients.
-
 _MU = 255.0
 _1_OVER_LN1P_MU = 1.0 / 5.545177444479562  # 1 / ln(1 + 255)
 
@@ -163,16 +160,22 @@ class FireFlyOptim(AdamW8bit):
                 state["r_q"] = r_q
                 state["r_absmax"] = r_absmax
 
-            m = _dequantize_blockwise_signed(state["m_q"], state["m_absmax"], bs, g.shape)
-            v = _dequantize_blockwise_unsigned(state["v_q"], state["v_absmax"], bs, g.shape)
-            residual = _dequantize_blockwise_signed(state["r_q"], state["r_absmax"], bs, g.shape)
+            m = _dequantize_blockwise_signed(
+                state["m_q"], state["m_absmax"], bs, g.shape
+            )
+            v = _dequantize_blockwise_unsigned(
+                state["v_q"], state["v_absmax"], bs, g.shape
+            )
+            residual = _dequantize_blockwise_signed(
+                state["r_q"], state["r_absmax"], bs, g.shape
+            )
             state["step"] += 1
             t = state["step"]
 
             m.mul_(beta1).add_(g, alpha=1.0 - beta1)
             v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
-            m_hat = m / (1.0 - beta1 ** t)
-            v_hat = v / (1.0 - beta2 ** t)
+            m_hat = m / (1.0 - beta1**t)
+            v_hat = v / (1.0 - beta2**t)
 
             ws = module.weight_scale.float().unsqueeze(1).clamp_min(eps)
             iw = module.int_weight.float()
@@ -183,9 +186,7 @@ class FireFlyOptim(AdamW8bit):
             abs_res = residual.abs()
             base = torch.floor(abs_res)
             frac = abs_res - base
-            # Momentum-biased SR: if adam_term agrees with residual direction,
-            # boost flip probability so weights "stuck" by rounding get unstuck.
-            # tanh(adam_term) ∈ [-1, 1], scaled by 0.15 → max ±15% bias.
+            # Momentum-biased SR
             bias = torch.tanh(adam_term) * 0.15 * torch.sign(residual)
             frac_biased = (frac + bias).clamp(0.0, 1.0)
             extra = (torch.rand_like(frac) < frac_biased).float()
