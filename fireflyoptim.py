@@ -90,7 +90,6 @@ class FireFlyOptim(AdamW8bit):
         betas=(0.9, 0.999),
         eps=1e-8,
         weight_decay=0.1,
-        theta=0.0,
         bit_modules=None,
         block_size=256,
     ):
@@ -108,7 +107,6 @@ class FireFlyOptim(AdamW8bit):
             else []
         )
         self._bit_state: dict[int, dict[str, torch.Tensor | int]] = {}
-        self.theta = float(theta)
         self.block_size = int(block_size)
 
     def add_bit_modules(self, modules) -> None:
