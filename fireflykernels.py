@@ -44,12 +44,10 @@ def consume_bit_grad(handle: int) -> torch.Tensor | None:
 # ---------------------------------------------------------------------------
 # bitsandbytes backend
 # ---------------------------------------------------------------------------
-_BNB = None
 _BNB_F = None
 _BNB_FMT = "col_ampere"
 
 try:
-    import bitsandbytes as _BNB
     import bitsandbytes.functional as _BNB_F
 
     if torch.cuda.is_available():

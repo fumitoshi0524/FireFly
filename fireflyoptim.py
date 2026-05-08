@@ -92,6 +92,7 @@ class FireFlyOptim(AdamW8bit):
         weight_decay=0.1,
         bit_modules=None,
         block_size=256,
+        sr_bias_scale=0.15,
     ):
         super().__init__(
             params,
@@ -108,6 +109,7 @@ class FireFlyOptim(AdamW8bit):
         )
         self._bit_state: dict[int, dict[str, torch.Tensor | int]] = {}
         self.block_size = int(block_size)
+        self.sr_bias_scale = float(sr_bias_scale)
 
     def add_bit_modules(self, modules) -> None:
         for module in modules:
@@ -185,7 +187,7 @@ class FireFlyOptim(AdamW8bit):
             base = torch.floor(abs_res)
             frac = abs_res - base
             # Momentum-biased SR
-            bias = torch.tanh(adam_term) * 0.15 * torch.sign(residual)
+            bias = torch.tanh(adam_term) * self.sr_bias_scale * torch.sign(residual)
             frac_biased = (frac + bias).clamp(0.0, 1.0)
             extra = (torch.rand_like(frac) < frac_biased).float()
             delta_q = (torch.sign(residual) * (base + extra)).to(torch.int32)
