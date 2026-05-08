@@ -231,3 +231,28 @@ class FireFlyOptim(AdamW8bit):
                 key: value.clone() if torch.is_tensor(value) else value
                 for key, value in per_handle.items()
             }
+
+
+class FireFlyOptimSR(FireFlyOptim):
+    """FireFlyOptim with unbiased stochastic rounding (no momentum bias)."""
+
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.1,
+        bit_modules=None,
+        block_size=256,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            bit_modules=bit_modules,
+            block_size=block_size,
+            sr_bias_scale=0.0,
+        )
